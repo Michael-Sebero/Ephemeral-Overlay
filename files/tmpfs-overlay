@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Wrap heavy tools with mimalloc
+if [ -r /usr/lib/libmimalloc.so ]; then
+    RSYNC="env LD_PRELOAD=/usr/lib/libmimalloc.so rsync"
+    FIND="env LD_PRELOAD=/usr/lib/libmimalloc.so find"
+    LSOF="env LD_PRELOAD=/usr/lib/libmimalloc.so lsof"
+else
+    RSYNC="rsync"
+    FIND="find"
+    LSOF="lsof"
+fi
+
+DBG="/tmp/tmpfs-overlay.debug"
+exec 3>&1 1>>"$DBG" 2>&1
+
+# Config
+TMP_SIZE="5G"
+VAR_TMP_SIZE="1G"
+VAR_CACHE_SIZE="2G"
+USER_CACHE_SIZE="2G"
+
+CLEAN_INTERVAL=60
+STALE_MINUTES=10
+
+PIDFILE="/var/run/tmpfs-overlay.pid"
+LOGFILE="/var/log/tmpfs-overlay.log"
+PERSIST_ROOT="/persist"  # root for persistent copies (must be mounted/present)
+
+timestamp() { date +"%Y-%m-%dT%H:%M:%S%z"; }
+log() { printf '%s %s\n' "$(timestamp)" "$*" | tee -a "$LOGFILE" >&3; }
+
+# detect lsof/fuser availability (prefer lsof)
+USE_LSOF=0
+USE_FUSER=0
+if command -v lsof >/dev/null 2>&1; then
+    USE_LSOF=1
+elif command -v fuser >/dev/null 2>&1; then
+    USE_FUSER=1
+fi
+
+is_file_in_use() {
+    local file="$1"
+    [ -e "$file" ] || return 1
+    if [ "$USE_LSOF" -eq 1 ]; then
+        $LSOF -t -- "$file" >/dev/null 2>&1 && return 0 || return 1
+    elif [ "$USE_FUSER" -eq 1 ]; then
+        fuser -s -- "$file" >/dev/null 2>&1 && return 0 || return 1
+    else
+        local t
+        t="$(readlink -f -- "$file")" || return 1
+        for fd in /proc/[0-9]*/fd/*; do
+            [ -e "$fd" ] || continue
+            local link
+            link="$(readlink -f -- "$fd" 2>/dev/null)" || continue
+            [ "$link" = "$t" ] && return 0
+        done
+    fi
+    return 1
+}
+
+mount_tmpfs() {
+    local dir="$1" size="$2" mode="$3"
+    mkdir -p -- "$dir"
+    if mountpoint -q -- "$dir"; then
+        log "$dir already mounted, skipping."
+        return 0
+    fi
+    log "Mounting tmpfs on $dir (size=$size mode=$mode)..."
+    mount -t tmpfs -o "size=${size},mode=${mode}" none "$dir"
+}
+
+# bind persistent directories under SSD
+bind_persistent_dirs() {
+    local parent="$1"           # e.g. /var/cache or /home/user/.cache
+    shift
+    local dirs=("$@")           # subdirs to keep persistent
+    local persist_root="${PERSIST_ROOT}${parent}"
+    mkdir -p "$persist_root" || { log "ERROR: failed to mkdir $persist_root"; return 1; }
+
+    for d in "${dirs[@]}"; do
+        local src="$persist_root/$d"
+        local dest="$parent/$d"
+
+        # First time: if dest exists but src doesn't, move dest to src
+        if [ -d "$dest" ] && [ ! -e "$src" ]; then
+            mkdir -p "$(dirname "$src")"
+            if [ "$(ls -A "$dest" 2>/dev/null || true)" != "" ]; then
+                log "Moving existing $dest -> $src (first-run persistence)"
+                if command -v rsync >/dev/null 2>&1; then
+                    $RSYNC -a --remove-source-files "$dest"/ "$src"/ || true
+                    $FIND "$dest" -mindepth 1 -type d -empty -delete || true
+                else
+                    mv "$dest" "$src" || true
+                fi
+            fi
+        fi
+
+        # Ensure both directories exist
+        mkdir -p "$src" "$dest"
+        
+        # Bind mount the persistent directory
+        if ! mountpoint -q "$dest"; then
+            mount --bind "$src" "$dest"
+            log "Bind-mounted $src -> $dest"
+        else
+            log "$dest already a mountpoint, skipping bind."
+        fi
+    done
+}
+
+mount_user_caches() {
+    local users
+    users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }')
+    while IFS=: read -r username homedir; do
+        [ -n "$username" ] && [ -n "$homedir" ] || continue
+        [ -d "$homedir" ] || continue
+        local cache_dir="$homedir/.cache"
+        local user_stat
+        user_stat=$(stat -c "%u:%g" "$homedir" 2>/dev/null) || continue
+        local uid=${user_stat%:*}
+        local gid=${user_stat#*:}
+
+        if [ ! -d "$cache_dir" ]; then
+            mkdir -p "$cache_dir"
+            chown "${uid}:${gid}" "$cache_dir"
+            chmod 0700 "$cache_dir"
+        fi
+
+        if mountpoint -q -- "$cache_dir"; then
+            log "$cache_dir already mounted, skipping."
+            continue
+        fi
+
+        log "Mounting tmpfs on $cache_dir (size=$USER_CACHE_SIZE) for $username..."
+        mount -t tmpfs -o "size=${USER_CACHE_SIZE},mode=0700,uid=${uid},gid=${gid}" none "$cache_dir"
+        
+        # Bind mount persistent cache directories
+        bind_persistent_dirs "$cache_dir" paru nvidia mesa_shader_cache mesa_shader_cache_db
+        
+        # Fix ownership after bind mounting
+        chown "${uid}:${gid}" "$cache_dir" || true
+        for subdir in paru nvidia mesa_shader_cache mesa_shader_cache_db; do
+            if [ -d "$cache_dir/$subdir" ]; then
+                chown -R "${uid}:${gid}" "$cache_dir/$subdir" || true
+            fi
+        done
+    done <<< "$users"
+}
+
+umount_try() {
+    local dir="$1"
+    [ ! -d "$dir" ] && return 0
+    if ! mountpoint -q -- "$dir"; then return 0; fi
+
+    log "Attempting normal umount $dir..."
+    if umount "$dir" 2>/dev/null; then log "Unmounted $dir (normal)"; return 0; fi
+    log "Normal umount failed; trying force..."
+    if umount -f "$dir" 2>/dev/null; then log "Unmounted $dir (force)"; return 0; fi
+    log "Force umount failed; trying lazy..."
+    if umount -l "$dir" 2>/dev/null; then log "Unmounted $dir (lazy)"; return 0; fi
+    log "All umount attempts failed for $dir."
+    return 1
+}
+
+umount_user_caches() {
+    local users
+    users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }')
+    while read -r homedir; do
+        [ -n "$homedir" ] && [ -d "$homedir" ] || continue
+        local cache_dir="$homedir/.cache"
+        # Unmount bind mounts first
+        for subdir in mesa_shader_cache_db mesa_shader_cache nvidia paru; do
+            umount_try "$cache_dir/$subdir" || true
+        done
+        # Then unmount the tmpfs
+        umount_try "$cache_dir" || true
+    done <<< "$users"
+}
+
+umount_var_cache() {
+    # Unmount bind mounts first
+    umount_try /var/cache/pacman || true
+    # Then unmount the tmpfs
+    umount_try /var/cache || true
+}
+
+cleanup_stale_files() {
+    local exclude_dirs=("/var/cache/pacman")
+    for dir in /tmp /var/tmp; do
+        [ -d "$dir" ] || continue
+        $FIND "$dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null | \
+        while IFS= read -r -d '' file; do
+            is_file_in_use "$file" && log "Skipping in-use file: $file" || (rm -rf -- "$file" && log "Removed stale: $file")
+        done
+    done
+
+    if [ -d /var/cache ]; then
+        $FIND /var/cache -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null | \
+        while IFS= read -r -d '' file; do
+            for ex in "${exclude_dirs[@]}"; do
+                [[ "$file" == "$ex"* ]] && continue 2
+            done
+            is_file_in_use "$file" && log "Skipping in-use cache file: $file" || (rm -rf -- "$file" && log "Removed stale cache: $file")
+        done
+    fi
+
+    local users
+    users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $6 }')
+    while read -r homedir; do
+        [ -n "$homedir" ] || continue
+        local cache_dir="$homedir/.cache"
+        [ -d "$cache_dir" ] || continue
+        local user_exclude_dirs=("paru" "nvidia" "mesa_shader_cache" "mesa_shader_cache_db")
+        $FIND "$cache_dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null | \
+        while IFS= read -r -d '' file; do
+            for ex in "${user_exclude_dirs[@]}"; do
+                [[ "$file" == "$cache_dir/$ex"* ]] && continue 2
+            done
+            is_file_in_use "$file" && log "Skipping in-use user cache file: $file" || (rm -rf -- "$file" && log "Removed stale user cache: $file")
+        done
+    done <<< "$users"
+}
+
+shutdown_cleanup() {
+    log "Signal received: performing shutdown cleanup..."
+    
+    # Sync all pending writes to disk before unmounting
+    log "Syncing filesystem..."
+    sync
+    
+    # Close file descriptors that might reference tmpfs
+    exec 1>&- 2>&- 3>&-
+    
+    # Change to root to avoid holding references
+    cd / 2>/dev/null || true
+    
+    # Give system time to stop other processes
+    sleep 1
+    
+    # Unmount in reverse order (bind mounts first, then tmpfs)
+    umount_user_caches
+    umount_var_cache
+    umount_try /var/tmp || true
+    umount_try /tmp || true
+    
+    [ -f "$PIDFILE" ] && rm -f -- "$PIDFILE"
+    
+    # Exit without logging (file descriptors closed)
+    exit 0
+}
+
+# Only trap INT and TERM, not EXIT (EXIT conflicts with normal termination)
+trap shutdown_cleanup INT TERM
+
+mkdir -p "$PERSIST_ROOT"
+
+mkdir -p "$(dirname "$LOGFILE")"
+mkdir -p "$(dirname "$PIDFILE")"
+touch "$LOGFILE" || true
+
+log "tmpfs-overlay starting."
+[ "$USE_LSOF" -eq 1 ] && log "Using lsof to detect open files." || log "lsof not present; using fuser or /proc fallback."
+
+echo $$ > "$PIDFILE"
+chmod 0644 "$PIDFILE"
+
+# Mount tmpfs overlays
+mount_tmpfs /tmp "$TMP_SIZE" 1777
+mount_tmpfs /var/tmp "$VAR_TMP_SIZE" 1777
+mount_tmpfs /var/cache "$VAR_CACHE_SIZE" 0755
+
+# Bind mount persistent directories from /persist to tmpfs
+bind_persistent_dirs /var/cache pacman
+
+mount_user_caches
+
+# Fix permissions for user cache directories
+getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }' | \
+while IFS=: read -r username homedir; do
+    [ -d "$homedir" ] || continue
+    if [ -d "$homedir/.cache" ]; then
+        uidgid=$(stat -c "%u:%g" "$homedir")
+        chown "$uidgid" "$homedir/.cache" || true
+        chmod 0700 "$homedir/.cache" || true
+        log "Fixed perms for $homedir/.cache"
+    fi
+done
+
+log "Entering cleanup loop (interval=${CLEAN_INTERVAL}s, stale>${STALE_MINUTES}m). pid=$(cat "$PIDFILE" 2>/dev/null || echo unknown)"
+
+# Change to root directory before entering loop to avoid holding references
+cd /
+
+while true; do
+    sleep "$CLEAN_INTERVAL" &
+    wait $!  # This allows signals to interrupt the sleep
+    cleanup_stale_files
+done
