@@ -26,12 +26,16 @@ STALE_MINUTES=10
 
 PIDFILE="/var/run/tmpfs-overlay.pid"
 LOGFILE="/var/log/tmpfs-overlay.log"
-PERSIST_ROOT="/persist"  # root for persistent copies (must be mounted/present)
+PERSIST_ROOT="/persist"
+
+# Bind-mounted directories
+BIND_MOUNTED_VAR_CACHE=(pacman)
+BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db)
 
 timestamp() { date +"%Y-%m-%dT%H:%M:%S%z"; }
 log() { printf '%s %s\n' "$(timestamp)" "$*" | tee -a "$LOGFILE" >&3; }
 
-# detect lsof/fuser availability (prefer lsof)
+# Detect lsof/fuser availability (prefer lsof)
 USE_LSOF=0
 USE_FUSER=0
 if command -v lsof >/dev/null 2>&1; then
@@ -71,11 +75,10 @@ mount_tmpfs() {
     mount -t tmpfs -o "size=${size},mode=${mode}" none "$dir"
 }
 
-# bind persistent directories under SSD
 bind_persistent_dirs() {
-    local parent="$1"           # e.g. /var/cache or /home/user/.cache
+    local parent="$1"
     shift
-    local dirs=("$@")           # subdirs to keep persistent
+    local dirs=("$@")
     local persist_root="${PERSIST_ROOT}${parent}"
     mkdir -p "$persist_root" || { log "ERROR: failed to mkdir $persist_root"; return 1; }
 
@@ -97,10 +100,8 @@ bind_persistent_dirs() {
             fi
         fi
 
-        # Ensure both directories exist
         mkdir -p "$src" "$dest"
         
-        # Bind mount the persistent directory
         if ! mountpoint -q "$dest"; then
             mount --bind "$src" "$dest"
             log "Bind-mounted $src -> $dest"
@@ -136,12 +137,12 @@ mount_user_caches() {
         log "Mounting tmpfs on $cache_dir (size=$USER_CACHE_SIZE) for $username..."
         mount -t tmpfs -o "size=${USER_CACHE_SIZE},mode=0700,uid=${uid},gid=${gid}" none "$cache_dir"
         
-        # Bind mount persistent cache directories
-        bind_persistent_dirs "$cache_dir" paru nvidia mesa_shader_cache mesa_shader_cache_db
+        # Bind mount persistent cache directories using config array
+        bind_persistent_dirs "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
         
         # Fix ownership after bind mounting
         chown "${uid}:${gid}" "$cache_dir" || true
-        for subdir in paru nvidia mesa_shader_cache mesa_shader_cache_db; do
+        for subdir in "${BIND_MOUNTED_USER_CACHE[@]}"; do
             if [ -d "$cache_dir/$subdir" ]; then
                 chown -R "${uid}:${gid}" "$cache_dir/$subdir" || true
             fi
@@ -166,28 +167,33 @@ umount_try() {
 
 umount_user_caches() {
     local users
-    users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }')
+    users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $6 }')
     while read -r homedir; do
         [ -n "$homedir" ] && [ -d "$homedir" ] || continue
         local cache_dir="$homedir/.cache"
-        # Unmount bind mounts first
-        for subdir in mesa_shader_cache_db mesa_shader_cache nvidia paru; do
-            umount_try "$cache_dir/$subdir" || true
+        # Unmount bind mounts first (reverse order)
+        for ((i=${#BIND_MOUNTED_USER_CACHE[@]}-1; i>=0; i--)); do
+            umount_try "$cache_dir/${BIND_MOUNTED_USER_CACHE[i]}" || true
         done
-        # Then unmount the tmpfs
         umount_try "$cache_dir" || true
     done <<< "$users"
 }
 
 umount_var_cache() {
-    # Unmount bind mounts first
-    umount_try /var/cache/pacman || true
-    # Then unmount the tmpfs
+    # Unmount bind mounts first (reverse order)
+    for ((i=${#BIND_MOUNTED_VAR_CACHE[@]}-1; i>=0; i--)); do
+        umount_try "/var/cache/${BIND_MOUNTED_VAR_CACHE[i]}" || true
+    done
     umount_try /var/cache || true
 }
 
 cleanup_stale_files() {
-    local exclude_dirs=("/var/cache/pacman")
+    # Build exclude patterns from bind-mounted directories
+    local var_cache_excludes=()
+    for dir in "${BIND_MOUNTED_VAR_CACHE[@]}"; do
+        var_cache_excludes+=("/var/cache/$dir")
+    done
+
     for dir in /tmp /var/tmp; do
         [ -d "$dir" ] || continue
         $FIND "$dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null | \
@@ -199,7 +205,7 @@ cleanup_stale_files() {
     if [ -d /var/cache ]; then
         $FIND /var/cache -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null | \
         while IFS= read -r -d '' file; do
-            for ex in "${exclude_dirs[@]}"; do
+            for ex in "${var_cache_excludes[@]}"; do
                 [[ "$file" == "$ex"* ]] && continue 2
             done
             is_file_in_use "$file" && log "Skipping in-use cache file: $file" || (rm -rf -- "$file" && log "Removed stale cache: $file")
@@ -212,10 +218,9 @@ cleanup_stale_files() {
         [ -n "$homedir" ] || continue
         local cache_dir="$homedir/.cache"
         [ -d "$cache_dir" ] || continue
-        local user_exclude_dirs=("paru" "nvidia" "mesa_shader_cache" "mesa_shader_cache_db")
         $FIND "$cache_dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null | \
         while IFS= read -r -d '' file; do
-            for ex in "${user_exclude_dirs[@]}"; do
+            for ex in "${BIND_MOUNTED_USER_CACHE[@]}"; do
                 [[ "$file" == "$cache_dir/$ex"* ]] && continue 2
             done
             is_file_in_use "$file" && log "Skipping in-use user cache file: $file" || (rm -rf -- "$file" && log "Removed stale user cache: $file")
@@ -225,37 +230,25 @@ cleanup_stale_files() {
 
 shutdown_cleanup() {
     log "Signal received: performing shutdown cleanup..."
-    
-    # Sync all pending writes to disk before unmounting
     log "Syncing filesystem..."
     sync
     
-    # Close file descriptors that might reference tmpfs
     exec 1>&- 2>&- 3>&-
-    
-    # Change to root to avoid holding references
     cd / 2>/dev/null || true
-    
-    # Give system time to stop other processes
     sleep 1
     
-    # Unmount in reverse order (bind mounts first, then tmpfs)
     umount_user_caches
     umount_var_cache
     umount_try /var/tmp || true
     umount_try /tmp || true
     
     [ -f "$PIDFILE" ] && rm -f -- "$PIDFILE"
-    
-    # Exit without logging (file descriptors closed)
     exit 0
 }
 
-# Only trap INT and TERM, not EXIT (EXIT conflicts with normal termination)
 trap shutdown_cleanup INT TERM
 
 mkdir -p "$PERSIST_ROOT"
-
 mkdir -p "$(dirname "$LOGFILE")"
 mkdir -p "$(dirname "$PIDFILE")"
 touch "$LOGFILE" || true
@@ -271,9 +264,8 @@ mount_tmpfs /tmp "$TMP_SIZE" 1777
 mount_tmpfs /var/tmp "$VAR_TMP_SIZE" 1777
 mount_tmpfs /var/cache "$VAR_CACHE_SIZE" 0755
 
-# Bind mount persistent directories from /persist to tmpfs
-bind_persistent_dirs /var/cache pacman
-
+# Bind mount persistent directories using config arrays
+bind_persistent_dirs /var/cache "${BIND_MOUNTED_VAR_CACHE[@]}"
 mount_user_caches
 
 # Fix permissions for user cache directories
@@ -290,11 +282,10 @@ done
 
 log "Entering cleanup loop (interval=${CLEAN_INTERVAL}s, stale>${STALE_MINUTES}m). pid=$(cat "$PIDFILE" 2>/dev/null || echo unknown)"
 
-# Change to root directory before entering loop to avoid holding references
 cd /
 
 while true; do
     sleep "$CLEAN_INTERVAL" &
-    wait $!  # This allows signals to interrupt the sleep
+    wait $!
     cleanup_stale_files
 done
