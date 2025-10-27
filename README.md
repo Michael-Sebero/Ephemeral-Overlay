@@ -42,5 +42,5 @@
 1. Copy the script to `/bin` and make it executable:
 
 ```bash
-sudo cp tmpfs-overlay /bin/
-sudo chmod 755 /bin/tmpfs-overlay
+sudo cp ephemeral-overlay /bin/
+sudo chmod 755 /bin/ephemeral-overlay
