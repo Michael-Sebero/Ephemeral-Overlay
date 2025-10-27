@@ -2,7 +2,6 @@
 
 set -e
 
-# Wrap heavy tools with mimalloc if available
 if [ -r /usr/lib/libmimalloc.so ]; then
     RSYNC="env LD_PRELOAD=/usr/lib/libmimalloc.so rsync"
     FIND="env LD_PRELOAD=/usr/lib/libmimalloc.so find"
@@ -13,7 +12,6 @@ else
     LSOF="lsof"
 fi
 
-# Configuration - Main overlay
 OVERLAY_BASE="/ram_overlay"
 UPPERDIR="$OVERLAY_BASE/upper"
 WORKDIR="$OVERLAY_BASE/work"
@@ -22,7 +20,6 @@ STATE_FILE="/var/run/ramoverlay.state"
 DAEMON_PIDFILE="/var/run/ramoverlay-daemon.pid"
 LOG_FILE="/var/log/ramoverlay.log"
 
-# Configuration - tmpfs mounts
 TMP_SIZE="5G"
 VAR_TMP_SIZE="1G"
 VAR_CACHE_SIZE="2G"
@@ -33,11 +30,9 @@ STALE_MINUTES=10
 
 PERSIST_ROOT="/persist"
 
-# Bind-mounted directories (persistent within tmpfs)
 BIND_MOUNTED_VAR_CACHE=(pacman)
 BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db)
 
-# Excluded directories from main overlay (stay on disk or handled by tmpfs)
 EXCLUDED_DIRS=(
     "/home"
     "/tmp"
@@ -52,7 +47,6 @@ EXCLUDED_DIRS=(
     "/boot"
 )
 
-# Detect lsof/fuser availability (prefer lsof)
 USE_LSOF=0
 USE_FUSER=0
 if command -v lsof >/dev/null 2>&1; then
@@ -77,8 +71,6 @@ check_root() {
 is_active() {
     [ -f "$STATE_FILE" ] && grep -q "active" "$STATE_FILE"
 }
-
-# tmpfs and file-in-use detection functions
 
 is_file_in_use() {
     local file="$1"
@@ -122,7 +114,6 @@ bind_persistent_dirs() {
         local src="$persist_root/$d"
         local dest="$parent/$d"
 
-        # First time: if dest exists but src doesn't, move dest to src
         if [ -d "$dest" ] && [ ! -e "$src" ]; then
             mkdir -p "$(dirname "$src")"
             if [ "$(ls -A "$dest" 2>/dev/null || true)" != "" ]; then
@@ -173,10 +164,8 @@ mount_user_caches() {
         log "Mounting tmpfs on $cache_dir (size=$USER_CACHE_SIZE) for $username..."
         mount -t tmpfs -o "size=${USER_CACHE_SIZE},mode=0700,uid=${uid},gid=${gid}" none "$cache_dir"
         
-        # Bind mount persistent cache directories using config array
         bind_persistent_dirs "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
         
-        # Fix ownership after bind mounting
         chown "${uid}:${gid}" "$cache_dir" || true
         for subdir in "${BIND_MOUNTED_USER_CACHE[@]}"; do
             if [ -d "$cache_dir/$subdir" ]; then
@@ -207,7 +196,6 @@ umount_user_caches() {
     while read -r homedir; do
         [ -n "$homedir" ] && [ -d "$homedir" ] || continue
         local cache_dir="$homedir/.cache"
-        # Unmount bind mounts first (reverse order)
         for ((i=${#BIND_MOUNTED_USER_CACHE[@]}-1; i>=0; i--)); do
             umount_try "$cache_dir/${BIND_MOUNTED_USER_CACHE[i]}" || true
         done
@@ -216,7 +204,6 @@ umount_user_caches() {
 }
 
 umount_var_cache() {
-    # Unmount bind mounts first (reverse order)
     for ((i=${#BIND_MOUNTED_VAR_CACHE[@]}-1; i>=0; i--)); do
         umount_try "/var/cache/${BIND_MOUNTED_VAR_CACHE[i]}" || true
     done
@@ -224,7 +211,6 @@ umount_var_cache() {
 }
 
 cleanup_stale_files() {
-    # Build exclude patterns from bind-mounted directories
     local var_cache_excludes=()
     for dir in "${BIND_MOUNTED_VAR_CACHE[@]}"; do
         var_cache_excludes+=("/var/cache/$dir")
@@ -269,16 +255,13 @@ start_tmpfs_mounts() {
     
     mkdir -p "$PERSIST_ROOT"
     
-    # Mount tmpfs overlays
     mount_tmpfs /tmp "$TMP_SIZE" 1777
     mount_tmpfs /var/tmp "$VAR_TMP_SIZE" 1777
     mount_tmpfs /var/cache "$VAR_CACHE_SIZE" 0755
 
-    # Bind mount persistent directories using config arrays
     bind_persistent_dirs /var/cache "${BIND_MOUNTED_VAR_CACHE[@]}"
     mount_user_caches
 
-    # Fix permissions for user cache directories
     getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }' | \
     while IFS=: read -r username homedir; do
         [ -d "$homedir" ] || continue
@@ -306,24 +289,18 @@ stop_tmpfs_mounts() {
     log "tmpfs mounts stopped."
 }
 
-# Main overlay functions
-
 get_available_ram() {
-    # Get available RAM in KB and convert to human readable
-    # Use 90% of available RAM for tmpfs
-    local available_kb=$(awk '/MemAvailable/ {print int($2 * 0.9)}' /proc/meminfo)
-    local available_mb=$((available_kb / 1024))
-    echo "${available_mb}M"
+    local total_kb=$(awk '/MemTotal/ {print int($2 * 0.9)}' /proc/meminfo)
+    local total_mb=$((total_kb / 1024))
+    echo "${total_mb}M"
 }
 
 create_overlay_dirs() {
     log "Creating RAM overlay directories..."
     
-    # Get dynamic RAM size
     local ram_size=$(get_available_ram)
-    log "Detected available RAM: $ram_size (90% of available memory)"
+    log "Detected total RAM allocation: $ram_size (90% of total memory)"
     
-    # Create tmpfs mount for overlay storage
     mkdir -p "$OVERLAY_BASE"
     
     if ! mountpoint -q "$OVERLAY_BASE"; then
@@ -331,10 +308,8 @@ create_overlay_dirs() {
             { log "ERROR: Failed to mount tmpfs at $OVERLAY_BASE"; return 1; }
     fi
     
-    # Create overlay directories
     mkdir -p "$UPPERDIR" "$WORKDIR" "$MERGED"
     
-    # Create excluded directory structure in upperdir
     for dir in "${EXCLUDED_DIRS[@]}"; do
         mkdir -p "$UPPERDIR$dir"
     done
@@ -348,21 +323,16 @@ start_overlay() {
     
     log "Starting unified RAM overlay system..."
     
-    # Start tmpfs mounts first (for /tmp, /var/tmp, /var/cache, user caches)
     start_tmpfs_mounts
-    
     create_overlay_dirs
     
-    # Build lowerdir list (exclude certain directories)
     LOWERDIR="/"
     
-    # Mount overlay filesystem
     log "Mounting overlay filesystem..."
     mount -t overlay overlay \
         -o lowerdir=$LOWERDIR,upperdir=$UPPERDIR,workdir=$WORKDIR \
         "$MERGED" || { log "ERROR: Failed to mount overlay"; return 1; }
     
-    # Bind mount excluded directories to keep them on disk
     for dir in "${EXCLUDED_DIRS[@]}"; do
         if [ -d "$dir" ]; then
             mkdir -p "$MERGED$dir"
@@ -370,7 +340,6 @@ start_overlay() {
         fi
     done
     
-    # Mark as active
     echo "active" > "$STATE_FILE"
     echo "started=$(date +%s)" >> "$STATE_FILE"
     
@@ -378,7 +347,6 @@ start_overlay() {
     log "Overlay mounted at: $MERGED"
     log "Changes are being stored in RAM at: $UPPERDIR"
     
-    # Show RAM allocation
     df -h "$OVERLAY_BASE" 2>/dev/null | tail -1 | awk '{print "RAM allocated: " $2 " (Available: " $4 ")"}'
     
     log "tmpfs cleanup loop starting (interval=${CLEAN_INTERVAL}s, stale>${STALE_MINUTES}m)."
@@ -392,9 +360,7 @@ sync_changes() {
     
     log "Syncing changes from RAM to disk..."
     
-    # Sync only modified files from upperdir to root
-    # Using rsync with archive mode and update flag
-    $RSYNC -aAXHv --update \
+    $RSYNC -aAXHv \
         --exclude='/home/*' \
         --exclude='/tmp/*' \
         --exclude='/var/tmp/*' \
@@ -418,33 +384,27 @@ stop_overlay() {
     
     log "Stopping RAM overlay system..."
     
-    # Sync changes before stopping
     sync_changes
     
-    # Unmount excluded directories
     for dir in "${EXCLUDED_DIRS[@]}"; do
         if mountpoint -q "$MERGED$dir" 2>/dev/null; then
             umount "$MERGED$dir" 2>/dev/null || true
         fi
     done
     
-    # Unmount overlay
     if mountpoint -q "$MERGED"; then
         log "Unmounting overlay filesystem..."
         umount "$MERGED" || log "Warning: Failed to unmount overlay"
     fi
     
-    # Unmount tmpfs (this frees RAM)
     if mountpoint -q "$OVERLAY_BASE"; then
         log "Unmounting tmpfs and freeing RAM..."
         umount "$OVERLAY_BASE" || log "Warning: Failed to unmount tmpfs"
     fi
     
-    # Cleanup
     rmdir "$MERGED" 2>/dev/null || true
     rm -f "$STATE_FILE"
     
-    # Stop tmpfs mounts
     stop_tmpfs_mounts
     
     log "RAM overlay system stopped - RAM freed"
@@ -469,61 +429,37 @@ wait_for_login() {
     done
 }
 
-wait_for_logout() {
-    log "Monitoring for user logout..."
-    
-    while true; do
-        local users=$(get_logged_in_users)
-        
-        if [ "$users" -eq 0 ]; then
-            log "All users logged out"
-            return 0
-        fi
-        
-        sleep 5
-    done
-}
-
 shutdown_cleanup() {
-    log "Shutdown signal received - performing cleanup..."
+    log "Shutdown/reboot signal received - syncing all changes to disk..."
+    sync_changes
     stop_overlay
     rm -f "$DAEMON_PIDFILE"
-    log "Cleanup complete - exiting"
+    log "Shutdown sync complete - exiting"
     exit 0
 }
 
-# Main execution - fully automated
-
 check_root
 
-# Check if already running
 if [ -f "$DAEMON_PIDFILE" ] && kill -0 $(cat "$DAEMON_PIDFILE") 2>/dev/null; then
     log "Already running with PID $(cat $DAEMON_PIDFILE) - exiting"
     exit 0
 fi
 
-# Write PID
 echo $$ > "$DAEMON_PIDFILE"
 
-# Create log directory
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE" || true
 
 log "Unified RAM overlay daemon started (PID: $$)"
 [ "$USE_LSOF" -eq 1 ] && log "Using lsof to detect open files" || log "Using fuser or /proc fallback for file detection"
 
-# Handle shutdown signals
 trap shutdown_cleanup SIGTERM SIGINT SIGHUP
 
-# Main automated loop
 while true; do
-    # Wait for user to login
     wait_for_login
     
-    # Small delay to ensure login is complete
     sleep 3
     
-    # Start RAM overlay (includes tmpfs mounts)
     log "Starting RAM overlay system..."
     start_overlay
     
@@ -535,7 +471,6 @@ while true; do
         continue
     fi
     
-    # Run cleanup loop while users are logged in
     while [ $(get_logged_in_users) -gt 0 ]; do
         sleep "$CLEAN_INTERVAL"
         cleanup_stale_files
@@ -543,10 +478,8 @@ while true; do
     
     log "All users logged out - initiating shutdown sequence"
     
-    # Small delay before stopping
     sleep 2
     
-    # Stop RAM overlay (syncs and frees RAM)
     log "Stopping and syncing RAM overlay..."
     stop_overlay
     
@@ -558,6 +491,5 @@ while true; do
     
     log "System ready for next login cycle"
     
-    # Brief pause before next cycle
     sleep 5
 done
