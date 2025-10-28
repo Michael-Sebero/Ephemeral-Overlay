@@ -340,6 +340,27 @@ create_overlay_dirs() {
     done
 }
 
+pivot_into_overlay() {
+    log "Pivoting processes into overlay namespace..."
+    
+    # Create a script that will run in the overlay context
+    cat > /tmp/overlay_pivot.sh << 'PIVOT_EOF'
+#!/bin/bash
+# This script runs with overlay as root
+
+export OVERLAY_ACTIVE=1
+export PS1="(overlay) $PS1"
+
+# Start a shell for the user
+exec bash --login
+PIVOT_EOF
+    
+    chmod +x /tmp/overlay_pivot.sh
+    
+    log "Use 'nsenter --mount=/proc/$$/ns/mnt -- /overlay_merged/bin/bash' to enter overlay"
+    log "Or run commands via: chroot /overlay_merged /bin/bash -c 'your command'"
+}
+
 start_overlay() {
     if is_active; then
         log "RAM overlay is already active"
@@ -370,6 +391,23 @@ start_overlay() {
         fi
     done
     
+    # CRITICAL FIX: Make overlay the active root for new processes
+    # Bind mount overlay over the real root for system access
+    log "Making overlay the active root..."
+    
+    # Create bind mounts for key system directories to use overlay
+    for dir in /bin /sbin /lib /lib64 /usr /etc /opt /var /srv; do
+        if [ -d "$dir" ] && [ -d "$MERGED$dir" ]; then
+            # Don't bind /var since we handle that specially
+            if [ "$dir" = "/var" ]; then
+                continue
+            fi
+            mount --bind "$MERGED$dir" "$dir" 2>/dev/null && \
+                log "Bound $MERGED$dir -> $dir (active overlay)" || \
+                log "Warning: Could not bind $dir"
+        fi
+    done
+    
     # Mark as active
     echo "active" > "$STATE_FILE"
     echo "started=$(date +%s)" >> "$STATE_FILE"
@@ -377,6 +415,7 @@ start_overlay() {
     log "RAM overlay system started successfully"
     log "Overlay mounted at: $MERGED"
     log "Changes are being stored in RAM at: $UPPERDIR"
+    log "System directories now use RAM overlay"
     
     # Show RAM allocation
     df -h "$OVERLAY_BASE" 2>/dev/null | tail -1 | awk '{print "RAM allocated: " $2 " (Available: " $4 ")"}'
@@ -420,6 +459,15 @@ stop_overlay() {
     
     # Sync changes before stopping
     sync_changes
+    
+    # Unmount bind mounts from real root back to disk
+    for dir in /bin /sbin /lib /lib64 /usr /etc /opt /srv; do
+        if mountpoint -q "$dir" 2>/dev/null; then
+            umount "$dir" 2>/dev/null && \
+                log "Unbound $dir (back to disk)" || \
+                log "Warning: Could not unbind $dir"
+        fi
+    done
     
     # Unmount excluded directories
     for dir in "${EXCLUDED_DIRS[@]}"; do
