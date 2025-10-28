@@ -391,7 +391,6 @@ start_overlay() {
         fi
     done
     
-    # CRITICAL FIX: Make overlay the active root for new processes
     # Bind mount overlay over the real root for system access
     log "Making overlay the active root..."
     
