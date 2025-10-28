@@ -309,11 +309,11 @@ stop_tmpfs_mounts() {
 # Main overlay functions
 
 get_available_ram() {
-    # Get available RAM in KB and convert to human readable
-    # Use 90% of available RAM for tmpfs
-    local available_kb=$(awk '/MemAvailable/ {print int($2 * 0.9)}' /proc/meminfo)
-    local available_mb=$((available_kb / 1024))
-    echo "${available_mb}M"
+    # Get total RAM in KB and convert to human readable
+    # Use 90% of total RAM for overlay (aggressive caching)
+    local total_kb=$(awk '/MemTotal/ {print int($2 * 0.9)}' /proc/meminfo)
+    local total_mb=$((total_kb / 1024))
+    echo "${total_mb}M"
 }
 
 create_overlay_dirs() {
@@ -321,7 +321,7 @@ create_overlay_dirs() {
     
     # Get dynamic RAM size
     local ram_size=$(get_available_ram)
-    log "Detected available RAM: $ram_size (90% of available memory)"
+    log "Detected total RAM allocation: $ram_size (90% of total memory)"
     
     # Create tmpfs mount for overlay storage
     mkdir -p "$OVERLAY_BASE"
