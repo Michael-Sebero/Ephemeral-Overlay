@@ -13,10 +13,10 @@
 
 * **Tmpfs mounts for volatile directories:**
 
-  * `/tmp` → 5 GB
-  * `/var/tmp` → 1 GB
-  * `/var/cache` → 2 GB
-  * `/home/$USER/.cache` → 2 GB per user
+  * `/tmp` - 5 GB
+  * `/var/tmp` - 1 GB
+  * `/var/cache` - 2 GB
+  * `/home/$USER/.cache` - 2 GB per user
   * These are recreated at startup and cleaned periodically
 
 * **Persistent directories (bind-mounted on disk):**
