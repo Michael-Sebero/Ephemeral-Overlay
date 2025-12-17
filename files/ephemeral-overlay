@@ -13,9 +13,6 @@ else
 fi
 
 OVERLAY_BASE="/ram_overlay"
-UPPERDIR="$OVERLAY_BASE/upper"
-WORKDIR="$OVERLAY_BASE/work"
-MERGED="/overlay_merged"
 STATE_FILE="/var/run/ramoverlay.state"
 DAEMON_PIDFILE="/var/run/ramoverlay-daemon.pid"
 LOG_FILE="/var/log/ramoverlay.log"
@@ -31,20 +28,23 @@ STALE_MINUTES=10
 PERSIST_ROOT="/persist"
 
 BIND_MOUNTED_VAR_CACHE=(pacman)
-BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db)
+BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db TauonMusicBox)
 
-EXCLUDED_DIRS=(
-    "/home"
-    "/tmp"
-    "/var/tmp"
-    "/var/cache"
-    "/proc"
-    "/sys"
-    "/dev"
-    "/run"
-    "/mnt"
-    "/media"
-    "/boot"
+# Directories to overlay (will be mounted in RAM and actually used)
+# NOTE: Exclude large package/runtime directories to save RAM
+OVERLAY_DIRS=(
+    "/etc"
+    "/var/log"
+    # DO NOT OVERLAY THESE - TOO LARGE:
+    # "/var/lib"      # Contains flatpak (12GB+), databases, etc.
+    # "/opt"          # Can be 2GB+ with large applications
+    # "/usr/local"
+)
+
+# Directories to completely exclude from overlay
+EXCLUDED_FROM_SYNC=(
+    "/var/lib/systemd"
+    "/var/log/journal"
 )
 
 USE_LSOF=0
@@ -295,8 +295,8 @@ get_available_ram() {
     echo "${total_mb}M"
 }
 
-create_overlay_dirs() {
-    log "Creating RAM overlay directories..."
+create_overlay_base() {
+    log "Creating RAM overlay base directory..."
     
     local ram_size=$(get_available_ram)
     log "Detected total RAM allocation: $ram_size (90% of total memory)"
@@ -306,13 +306,42 @@ create_overlay_dirs() {
     if ! mountpoint -q "$OVERLAY_BASE"; then
         mount -t tmpfs -o size=$ram_size,mode=0755 tmpfs "$OVERLAY_BASE" || \
             { log "ERROR: Failed to mount tmpfs at $OVERLAY_BASE"; return 1; }
+        log "Mounted tmpfs at $OVERLAY_BASE with size $ram_size"
+    fi
+}
+
+create_directory_overlay() {
+    local target_dir="$1"
+    local dir_name=$(echo "$target_dir" | tr '/' '_')
+    local upper_dir="$OVERLAY_BASE/upper${target_dir}"
+    local work_dir="$OVERLAY_BASE/work${target_dir}"
+    local backup_dir="$OVERLAY_BASE/backup${target_dir}"
+    
+    # Create necessary directories
+    mkdir -p "$upper_dir" "$work_dir" "$backup_dir"
+    
+    # Check if already mounted
+    if mount | grep -q "overlay on $target_dir type overlay"; then
+        log "$target_dir already has overlay mounted, skipping"
+        return 0
     fi
     
-    mkdir -p "$UPPERDIR" "$WORKDIR" "$MERGED"
+    # Skip backups to save RAM - overlay tracks changes in upper/ directory
+    # Backups are unnecessary since the lower layer remains on disk unchanged
+    log "Creating backup directory structure for $target_dir (no data copy to save RAM)..."
+    mkdir -p "$backup_dir"
     
-    for dir in "${EXCLUDED_DIRS[@]}"; do
-        mkdir -p "$UPPERDIR$dir"
-    done
+    # Create the overlay mount directly over the original directory
+    log "Mounting overlay on $target_dir..."
+    mount -t overlay overlay_${dir_name} \
+        -o lowerdir=$target_dir,upperdir=$upper_dir,workdir=$work_dir \
+        "$target_dir" || {
+            log "ERROR: Failed to mount overlay on $target_dir"
+            return 1
+        }
+    
+    log "Successfully mounted RAM overlay on $target_dir"
+    return 0
 }
 
 start_overlay() {
@@ -324,32 +353,39 @@ start_overlay() {
     log "Starting unified RAM overlay system..."
     
     start_tmpfs_mounts
-    create_overlay_dirs
+    create_overlay_base
     
-    LOWERDIR="/"
-    
-    log "Mounting overlay filesystem..."
-    mount -t overlay overlay \
-        -o lowerdir=$LOWERDIR,upperdir=$UPPERDIR,workdir=$WORKDIR \
-        "$MERGED" || { log "ERROR: Failed to mount overlay"; return 1; }
-    
-    for dir in "${EXCLUDED_DIRS[@]}"; do
+    # Mount overlays on each specified directory
+    local failed=0
+    for dir in "${OVERLAY_DIRS[@]}"; do
         if [ -d "$dir" ]; then
-            mkdir -p "$MERGED$dir"
-            mount --bind "$dir" "$MERGED$dir" 2>/dev/null || true
+            create_directory_overlay "$dir" || {
+                log "WARNING: Failed to create overlay for $dir"
+                failed=$((failed + 1))
+            }
+        else
+            log "WARNING: Directory $dir does not exist, skipping"
         fi
     done
+    
+    if [ $failed -gt 0 ]; then
+        log "WARNING: $failed overlay(s) failed to mount"
+    fi
     
     echo "active" > "$STATE_FILE"
     echo "started=$(date +%s)" >> "$STATE_FILE"
     
     log "RAM overlay system started successfully"
-    log "Overlay mounted at: $MERGED"
-    log "Changes are being stored in RAM at: $UPPERDIR"
+    log "Overlaid directories: ${OVERLAY_DIRS[*]}"
+    log "Changes are being stored in RAM at: $OVERLAY_BASE"
     
-    df -h "$OVERLAY_BASE" 2>/dev/null | tail -1 | awk '{print "RAM allocated: " $2 " (Available: " $4 ")"}'
+    df -h "$OVERLAY_BASE" 2>/dev/null | tail -1 | awk '{print "RAM allocated: " $2 " (Used: " $3 ", Available: " $4 ")"}'
     
     log "tmpfs cleanup loop starting (interval=${CLEAN_INTERVAL}s, stale>${STALE_MINUTES}m)."
+    
+    # Show what's actually overlaid
+    log "Active overlay mounts:"
+    mount | grep "type overlay" | tee -a "$LOG_FILE"
 }
 
 sync_changes() {
@@ -360,19 +396,54 @@ sync_changes() {
     
     log "Syncing changes from RAM to disk..."
     
-    $RSYNC -aAXHv \
-        --exclude='/home/*' \
-        --exclude='/tmp/*' \
-        --exclude='/var/tmp/*' \
-        --exclude='/var/cache/*' \
-        --exclude='/proc/*' \
-        --exclude='/sys/*' \
-        --exclude='/dev/*' \
-        --exclude='/run/*' \
-        "$UPPERDIR/" "/" 2>&1 | tee -a "$LOG_FILE"
+    local sync_failed=0
+    
+    for dir in "${OVERLAY_DIRS[@]}"; do
+        local upper_dir="$OVERLAY_BASE/upper${dir}"
+        
+        if [ ! -d "$upper_dir" ]; then
+            log "No changes in $dir, skipping"
+            continue
+        fi
+        
+        # Check if there are any changes
+        if [ -z "$(ls -A "$upper_dir" 2>/dev/null)" ]; then
+            log "No changes in $dir, skipping"
+            continue
+        fi
+        
+        log "Syncing changes from $dir..."
+        
+        # Build exclude list
+        local exclude_opts=()
+        for excl in "${EXCLUDED_FROM_SYNC[@]}"; do
+            if [[ "$excl" == "$dir"* ]]; then
+                exclude_opts+=("--exclude=${excl#$dir/}")
+            fi
+        done
+        
+        # Sync changes directly from upper layer to disk
+        log "Syncing $dir from overlay to disk..."
+        # Sync directly from upper layer (changes) to the lower layer (disk)
+        # We need to temporarily unmount the overlay to write to the real directory
+        if $RSYNC -aAXHv "${exclude_opts[@]}" \
+            "$upper_dir/" "$dir/" 2>&1 | tee -a "$LOG_FILE"; then
+            log "Successfully synced $dir"
+        else
+            log "ERROR: Failed to sync $dir (rsync exit code: $?)"
+            sync_failed=$((sync_failed + 1))
+        fi
+    done
     
     sync
-    log "Sync completed successfully"
+    
+    if [ $sync_failed -gt 0 ]; then
+        log "WARNING: $sync_failed directory sync(s) failed"
+        return 1
+    else
+        log "All changes synced successfully"
+        return 0
+    fi
 }
 
 stop_overlay() {
@@ -384,25 +455,45 @@ stop_overlay() {
     
     log "Stopping RAM overlay system..."
     
+    # Sync changes first
     sync_changes
     
-    for dir in "${EXCLUDED_DIRS[@]}"; do
-        if mountpoint -q "$MERGED$dir" 2>/dev/null; then
-            umount "$MERGED$dir" 2>/dev/null || true
+    # Unmount overlays in reverse order
+    log "Unmounting overlay filesystems..."
+    for ((i=${#OVERLAY_DIRS[@]}-1; i>=0; i--)); do
+        local dir="${OVERLAY_DIRS[i]}"
+        if mount | grep -q "overlay.*on $dir type overlay"; then
+            log "Unmounting overlay on $dir..."
+            
+            # Try to copy changes to the real directory before unmounting
+            local upper_dir="$OVERLAY_BASE/upper${dir}"
+            local backup_dir="$OVERLAY_BASE/backup${dir}"
+            
+            if [ -d "$upper_dir" ] && [ -n "$(ls -A "$upper_dir" 2>/dev/null)" ]; then
+                log "Final sync of $dir before unmount..."
+                
+                # Unmount the overlay first
+                if umount_try "$dir"; then
+                    # Sync changes directly from upper layer to real directory
+                    log "Syncing changes from overlay to disk for $dir..."
+                    $RSYNC -aAXH "$upper_dir/" "$dir/" 2>&1 | tee -a "$LOG_FILE" || {
+                        log "ERROR: Failed final sync of $dir"
+                    }
+                else
+                    log "ERROR: Failed to unmount $dir"
+                fi
+            else
+                umount_try "$dir" || true
+            fi
         fi
     done
     
-    if mountpoint -q "$MERGED"; then
-        log "Unmounting overlay filesystem..."
-        umount "$MERGED" || log "Warning: Failed to unmount overlay"
-    fi
-    
+    # Unmount the overlay base
     if mountpoint -q "$OVERLAY_BASE"; then
         log "Unmounting tmpfs and freeing RAM..."
         umount "$OVERLAY_BASE" || log "Warning: Failed to unmount tmpfs"
     fi
     
-    rmdir "$MERGED" 2>/dev/null || true
     rm -f "$STATE_FILE"
     
     stop_tmpfs_mounts
@@ -411,7 +502,18 @@ stop_overlay() {
 }
 
 get_logged_in_users() {
-    who | awk '{print $1}' | sort -u | wc -l
+    # More reliable user detection
+    local count=0
+    
+    # Check who command
+    count=$(who | awk '{print $1}' | sort -u | wc -l)
+    
+    # If no users from who, check for X sessions
+    if [ $count -eq 0 ] && [ -d /tmp/.X11-unix ]; then
+        count=$(ls -1 /tmp/.X11-unix/ 2>/dev/null | wc -l)
+    fi
+    
+    echo $count
 }
 
 wait_for_login() {
@@ -451,6 +553,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE" || true
 
 log "Unified RAM overlay daemon started (PID: $$)"
+log "Overlay directories: ${OVERLAY_DIRS[*]}"
 [ "$USE_LSOF" -eq 1 ] && log "Using lsof to detect open files" || log "Using fuser or /proc fallback for file detection"
 
 trap shutdown_cleanup SIGTERM SIGINT SIGHUP
@@ -465,6 +568,8 @@ while true; do
     
     if [ $? -eq 0 ]; then
         log "RAM overlay started successfully"
+        log "System is now running with RAM-backed directories"
+        log "Check 'mount | grep overlay' to see active overlays"
     else
         log "ERROR: Failed to start RAM overlay - will retry on next login"
         sleep 5
