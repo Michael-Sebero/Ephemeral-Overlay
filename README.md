@@ -227,14 +227,6 @@ Based on benchmarks with SATA SSD (Samsung 870 EVO):
 | Sequential Write | 530 MB/s | 2,128 MB/s | **4x faster** |
 | RAM Usage | 0 | ~200MB | Minimal overhead |
 
-### Real-World Impact
-
-* Config file edits feel instant
-* Package manager operations are significantly faster
-* Log writes cause zero disk I/O
-* Reduced SSD wear (70-80% fewer writes to `/etc` and `/var/log`)
-* Snappier system responsiveness overall
-
 ---
 
 ## Safety Features
@@ -246,39 +238,3 @@ Based on benchmarks with SATA SSD (Samsung 870 EVO):
 * **Protected directories:** User data in `/home` is never overlaid
 * **Atomic operations:** Uses proper overlay filesystem semantics
 * **Fallback mechanisms:** Multiple methods for file-in-use detection
-
----
-
-## Troubleshooting
-
-### Check If Overlay Is Active
-
-```bash
-mount | grep overlay
-# Should show: overlay__etc on /etc and overlay__var_log on /var/log
-```
-
-### View the Log
-
-```bash
-sudo tail -100 /var/log/ramoverlay.log
-```
-
-### Manually Trigger Sync (While Logged In)
-
-```bash
-sudo kill -HUP $(cat /var/run/ramoverlay-daemon.pid)
-```
-
-### Free Up RAM If Usage Is Too High
-
-* Remove large directories from `OVERLAY_DIRS`
-* Reduce `STALE_MINUTES` for more aggressive cleanup
-* Decrease tmpfs size limits
-
-### Overlay Not Working
-
-* Ensure script is executable: `sudo chmod +x /bin/ephemeral-overlay`
-* Check if daemon is running: `ps aux | grep ephemeral-overlay`
-* Verify rc.local syntax and permissions
-* Check log for errors: `/var/log/ramoverlay.log`
