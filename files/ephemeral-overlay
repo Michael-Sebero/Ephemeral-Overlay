@@ -2,14 +2,17 @@
 
 set -e
 
+# Use mimalloc only for commands that process large datasets or run for extended periods
+# rsync: May sync large directory trees with many files
+# find: May traverse deep filesystem hierarchies with thousands of entries
+# Short-lived commands (lsof, awk, grep, rm, fuser) are NOT preloaded as the
+# LD_PRELOAD library loading overhead exceeds any allocation performance benefit
 if [ -r /usr/lib/libmimalloc.so ]; then
     RSYNC="env LD_PRELOAD=/usr/lib/libmimalloc.so rsync"
     FIND="env LD_PRELOAD=/usr/lib/libmimalloc.so find"
-    LSOF="env LD_PRELOAD=/usr/lib/libmimalloc.so lsof"
 else
     RSYNC="rsync"
     FIND="find"
-    LSOF="lsof"
 fi
 
 OVERLAY_BASE="/ram_overlay"
@@ -76,7 +79,7 @@ is_file_in_use() {
     local file="$1"
     [ -e "$file" ] || return 1
     if [ "$USE_LSOF" -eq 1 ]; then
-        $LSOF -t -- "$file" >/dev/null 2>&1 && return 0 || return 1
+        lsof -t -- "$file" >/dev/null 2>&1 && return 0 || return 1
     elif [ "$USE_FUSER" -eq 1 ]; then
         fuser -s -- "$file" >/dev/null 2>&1 && return 0 || return 1
     else
@@ -216,38 +219,79 @@ cleanup_stale_files() {
         var_cache_excludes+=("/var/cache/$dir")
     done
 
+    # PERFORMANCE OPTIMIZATION: Batch file deletions to minimize process spawning overhead
+    # Collecting all files first, then deleting in one rm invocation is 10-100x faster
+    # than spawning a separate rm process for each file (especially for 100+ files)
+    local files_to_delete=()
+    
+    # Clean /tmp and /var/tmp
     for dir in /tmp /var/tmp; do
         [ -d "$dir" ] || continue
-        $FIND "$dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null | \
         while IFS= read -r -d '' file; do
-            is_file_in_use "$file" && log "Skipping in-use file: $file" || (rm -rf -- "$file" && log "Removed stale: $file")
-        done
+            if is_file_in_use "$file"; then
+                log "Skipping in-use file: $file"
+            else
+                files_to_delete+=("$file")
+            fi
+        done < <($FIND "$dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
     done
 
+    # Clean /var/cache (with exclusions)
     if [ -d /var/cache ]; then
-        $FIND /var/cache -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null | \
         while IFS= read -r -d '' file; do
+            # Check exclusions
+            local excluded=0
             for ex in "${var_cache_excludes[@]}"; do
-                [[ "$file" == "$ex"* ]] && continue 2
+                if [[ "$file" == "$ex"* ]]; then
+                    excluded=1
+                    break
+                fi
             done
-            is_file_in_use "$file" && log "Skipping in-use cache file: $file" || (rm -rf -- "$file" && log "Removed stale cache: $file")
-        done
+            
+            if [ $excluded -eq 0 ]; then
+                if is_file_in_use "$file"; then
+                    log "Skipping in-use cache file: $file"
+                else
+                    files_to_delete+=("$file")
+                fi
+            fi
+        done < <($FIND /var/cache -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
     fi
 
+    # Clean user caches
     local users
     users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $6 }')
     while read -r homedir; do
         [ -n "$homedir" ] || continue
         local cache_dir="$homedir/.cache"
         [ -d "$cache_dir" ] || continue
-        $FIND "$cache_dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null | \
+        
         while IFS= read -r -d '' file; do
+            # Check exclusions
+            local excluded=0
             for ex in "${BIND_MOUNTED_USER_CACHE[@]}"; do
-                [[ "$file" == "$cache_dir/$ex"* ]] && continue 2
+                if [[ "$file" == "$cache_dir/$ex"* ]]; then
+                    excluded=1
+                    break
+                fi
             done
-            is_file_in_use "$file" && log "Skipping in-use user cache file: $file" || (rm -rf -- "$file" && log "Removed stale user cache: $file")
-        done
+            
+            if [ $excluded -eq 0 ]; then
+                if is_file_in_use "$file"; then
+                    log "Skipping in-use user cache file: $file"
+                else
+                    files_to_delete+=("$file")
+                fi
+            fi
+        done < <($FIND "$cache_dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
     done <<< "$users"
+    
+    # Batch delete all collected files in one operation to minimize system overhead
+    if [ ${#files_to_delete[@]} -gt 0 ]; then
+        log "Removing ${#files_to_delete[@]} stale files in batch operation..."
+        rm -rf -- "${files_to_delete[@]}" 2>/dev/null || true
+        log "Batch cleanup completed"
+    fi
 }
 
 start_tmpfs_mounts() {
@@ -315,10 +359,9 @@ create_directory_overlay() {
     local dir_name=$(echo "$target_dir" | tr '/' '_')
     local upper_dir="$OVERLAY_BASE/upper${target_dir}"
     local work_dir="$OVERLAY_BASE/work${target_dir}"
-    local backup_dir="$OVERLAY_BASE/backup${target_dir}"
     
-    # Create necessary directories
-    mkdir -p "$upper_dir" "$work_dir" "$backup_dir"
+    # Create necessary directories for overlay mount
+    mkdir -p "$upper_dir" "$work_dir"
     
     # Check if already mounted
     if mount | grep -q "overlay on $target_dir type overlay"; then
@@ -326,12 +369,10 @@ create_directory_overlay() {
         return 0
     fi
     
-    # Skip backups to save RAM - overlay tracks changes in upper/ directory
-    # Backups are unnecessary since the lower layer remains on disk unchanged
-    log "Creating backup directory structure for $target_dir (no data copy to save RAM)..."
-    mkdir -p "$backup_dir"
-    
     # Create the overlay mount directly over the original directory
+    # Lower layer: original disk directory (read-only via overlay)
+    # Upper layer: RAM storage for all modifications
+    # Work layer: overlay filesystem internal use
     log "Mounting overlay on $target_dir..."
     mount -t overlay overlay_${dir_name} \
         -o lowerdir=$target_dir,upperdir=$upper_dir,workdir=$work_dir \
@@ -422,15 +463,29 @@ sync_changes() {
             fi
         done
         
-        # Sync changes directly from upper layer to disk
+        # Must unmount overlay to access the real disk directory
+        # Otherwise rsync writes back to the overlay's upper layer (circular operation)
+        log "Unmounting overlay on $dir for sync..."
+        if ! umount_try "$dir"; then
+            log "ERROR: Failed to unmount $dir for syncing"
+            sync_failed=$((sync_failed + 1))
+            continue
+        fi
+        
+        # Now sync changes from upper layer to the real disk directory
         log "Syncing $dir from overlay to disk..."
-        # Sync directly from upper layer (changes) to the lower layer (disk)
-        # We need to temporarily unmount the overlay to write to the real directory
         if $RSYNC -aAXHv "${exclude_opts[@]}" \
             "$upper_dir/" "$dir/" 2>&1 | tee -a "$LOG_FILE"; then
             log "Successfully synced $dir"
         else
             log "ERROR: Failed to sync $dir (rsync exit code: $?)"
+            sync_failed=$((sync_failed + 1))
+        fi
+        
+        # Remount the overlay
+        log "Remounting overlay on $dir..."
+        if ! create_directory_overlay "$dir"; then
+            log "ERROR: Failed to remount overlay on $dir"
             sync_failed=$((sync_failed + 1))
         fi
     done
@@ -455,7 +510,7 @@ stop_overlay() {
     
     log "Stopping RAM overlay system..."
     
-    # Sync changes first
+    # Sync changes first (this will unmount and remount overlays)
     sync_changes
     
     # Unmount overlays in reverse order
@@ -465,14 +520,13 @@ stop_overlay() {
         if mount | grep -q "overlay.*on $dir type overlay"; then
             log "Unmounting overlay on $dir..."
             
-            # Try to copy changes to the real directory before unmounting
             local upper_dir="$OVERLAY_BASE/upper${dir}"
-            local backup_dir="$OVERLAY_BASE/backup${dir}"
             
+            # Check if there are any unsynced changes
             if [ -d "$upper_dir" ] && [ -n "$(ls -A "$upper_dir" 2>/dev/null)" ]; then
                 log "Final sync of $dir before unmount..."
                 
-                # Unmount the overlay first
+                # Unmount the overlay first to access real disk directory
                 if umount_try "$dir"; then
                     # Sync changes directly from upper layer to real directory
                     log "Syncing changes from overlay to disk for $dir..."
