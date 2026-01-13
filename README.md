@@ -20,7 +20,7 @@ High-speed RAM storage for temporary files (automatically cleaned on logout):
 
 Essential caches bind-mounted to `/persist` to survive reboots:
 * System: `/var/cache/pacman`
-* User: `paru`, `nvidia`, `mesa_shader_cache`, `TauonMusicBox`
+* User: `paru`, `nvidia`, `mesa_shader_cache`
 * Automatically migrated on first run
 
 ### Excluded from Overlay (Remain on Disk)
@@ -93,7 +93,7 @@ BIND_MOUNTED_VAR_CACHE=(pacman)
 
 **Persistent user caches:**
 ```bash
-BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache TauonMusicBox)
+BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache)
 ```
 
 **Tmpfs sizes:**
