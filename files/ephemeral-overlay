@@ -31,7 +31,7 @@ STALE_MINUTES=10
 PERSIST_ROOT="/persist"
 
 BIND_MOUNTED_VAR_CACHE=(pacman)
-BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db TauonMusicBox)
+BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db)
 
 # Directories to overlay (will be mounted in RAM and actually used)
 # NOTE: Exclude large package/runtime directories to save RAM
