@@ -262,23 +262,24 @@ cleanup_stale_files() {
     local users
     users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $6 }')
     while read -r homedir; do
-        [ -n "$homedir" ] || continue
+        [ -n "$homedir" ] && [ -d "$homedir" ] || continue
         local cache_dir="$homedir/.cache"
         [ -d "$cache_dir" ] || continue
         
+        # Collect user cache files
         while IFS= read -r -d '' file; do
-            # Check exclusions
-            local excluded=0
-            for ex in "${BIND_MOUNTED_USER_CACHE[@]}"; do
-                if [[ "$file" == "$cache_dir/$ex"* ]]; then
-                    excluded=1
+            # Skip bind-mounted persistent directories
+            local skip=0
+            for bd in "${BIND_MOUNTED_USER_CACHE[@]}"; do
+                if [[ "$file" == "$cache_dir/$bd"* ]]; then
+                    skip=1
                     break
                 fi
             done
             
-            if [ $excluded -eq 0 ]; then
+            if [ $skip -eq 0 ]; then
                 if is_file_in_use "$file"; then
-                    log "Skipping in-use user cache file: $file"
+                    log "Skipping in-use user cache: $file"
                 else
                     files_to_delete+=("$file")
                 fi
@@ -286,16 +287,16 @@ cleanup_stale_files() {
         done < <($FIND "$cache_dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
     done <<< "$users"
     
-    # Batch delete all collected files in one operation to minimize system overhead
+    # Actually delete all collected files in batch
     if [ ${#files_to_delete[@]} -gt 0 ]; then
-        log "Removing ${#files_to_delete[@]} stale files in batch operation..."
-        rm -rf -- "${files_to_delete[@]}" 2>/dev/null || true
-        log "Batch cleanup completed"
+        log "Deleting ${#files_to_delete[@]} stale files..."
+        rm -rf "${files_to_delete[@]}" 2>/dev/null || true
+        log "Cleanup complete"
     fi
 }
 
 start_tmpfs_mounts() {
-    log "Starting tmpfs mounts for temporary directories..."
+    log "Starting tmpfs mounts..."
     
     mkdir -p "$PERSIST_ROOT"
     
@@ -375,7 +376,7 @@ create_directory_overlay() {
     # Work layer: overlay filesystem internal use
     log "Mounting overlay on $target_dir..."
     mount -t overlay overlay_${dir_name} \
-        -o lowerdir=$target_dir,upperdir=$upper_dir,workdir=$work_dir \
+        -o lowerdir=$target_dir,upperdir=$upper_dir,workdir=$work_dir,metacopy=off \
         "$target_dir" || {
             log "ERROR: Failed to mount overlay on $target_dir"
             return 1
