@@ -20,7 +20,7 @@ High-speed RAM storage for temporary files (automatically cleaned on logout):
 
 Essential caches bind-mounted to `/persist` to survive reboots:
 * System: `/var/cache/pacman`
-* User: `paru`, `nvidia`, `mesa_shader_cache`
+* User: `nvidia`, `mesa_shader_cache`, `mesa_shader_cache_db`
 * Automatically migrated on first run
 
 ### Excluded from Overlay (Remain on Disk)
@@ -46,7 +46,7 @@ Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync` and `find
 
 ## Requirements
 
-* **Commands:** `rsync`, `find`, and either `lsof` or `fuser`
+* **Commands:** `rsync` (falls back to `mv`), and `lsof` or `fuser` (falls back to `/proc` scanning) — none are hard requirements but `rsync` is strongly recommended for safe syncing
 * **RAM:** 16GB+ recommended (typical usage: 200MB-2GB)
 * **Filesystem:** Supports OverlayFS (ext4, btrfs, xfs, f2fs)
 * **Optional:** `libmimalloc.so` for faster syncs
@@ -93,7 +93,7 @@ BIND_MOUNTED_VAR_CACHE=(pacman)
 
 **Persistent user caches:**
 ```bash
-BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache)
+BIND_MOUNTED_USER_CACHE=(nvidia mesa_shader_cache mesa_shader_cache_db)
 ```
 
 **Tmpfs sizes:**
@@ -161,10 +161,10 @@ tail -f /var/log/ramoverlay.log
 
 ## Safety Features
 
-* **No data loss:** All changes synced to disk on logout and shutdown
+* **Best-effort persistence:** All changes are synced to disk on logout and shutdown; sync errors are detected and logged, but there is no retry logic or post-sync verification pass
 * **Signal handling:** Gracefully handles SIGTERM, SIGINT, and SIGHUP
 * **File-in-use detection:** Never deletes files that are currently open
-* **Rsync verification:** Checks exit codes and logs sync failures
+* **Rsync verification:** Checks rsync exit codes (captured independently of `tee`) and logs sync failures
 * **Protected directories:** User data in `/home` is never overlaid
-* **Atomic operations:** Uses proper OverlayFS semantics
+* **OverlayFS semantics:** Per-file writes are atomic via OverlayFS; however, the sync process (unmount → rsync → remount) is not crash-safe — a power loss mid-sync may leave the filesystem partially written
 * **Fallback mechanisms:** Multiple methods for file-in-use detection

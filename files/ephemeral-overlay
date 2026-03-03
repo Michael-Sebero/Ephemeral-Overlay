@@ -5,33 +5,38 @@ set -e
 # Use mimalloc only for commands that process large datasets or run for extended periods
 # rsync: May sync large directory trees with many files
 # find: May traverse deep filesystem hierarchies with thousands of entries
+# inotifywait: Long-lived daemon with frequent small allocations from event stream
 # Short-lived commands (lsof, awk, grep, rm, fuser) are NOT preloaded as the
 # LD_PRELOAD library loading overhead exceeds any allocation performance benefit
 if [ -r /usr/lib/libmimalloc.so ]; then
     RSYNC="env LD_PRELOAD=/usr/lib/libmimalloc.so rsync"
     FIND="env LD_PRELOAD=/usr/lib/libmimalloc.so find"
+    INOTIFYWAIT="env LD_PRELOAD=/usr/lib/libmimalloc.so inotifywait"
 else
     RSYNC="rsync"
     FIND="find"
+    INOTIFYWAIT="inotifywait"
 fi
 
 OVERLAY_BASE="/ram_overlay"
 STATE_FILE="/var/run/ramoverlay.state"
 DAEMON_PIDFILE="/var/run/ramoverlay-daemon.pid"
 LOG_FILE="/var/log/ramoverlay.log"
+INOTIFY_QUEUE="/var/run/ramoverlay-inotify.queue"
+INOTIFY_PIDFILE="/var/run/ramoverlay-inotify.pid"
 
 TMP_SIZE="5G"
 VAR_TMP_SIZE="1G"
 VAR_CACHE_SIZE="2G"
 USER_CACHE_SIZE="2G"
 
-CLEAN_INTERVAL=60
-STALE_MINUTES=10
+CLEAN_INTERVAL=30
+STALE_MINUTES=5
 
 PERSIST_ROOT="/persist"
 
 BIND_MOUNTED_VAR_CACHE=(pacman)
-BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db)
+BIND_MOUNTED_USER_CACHE=(nvidia mesa_shader_cache mesa_shader_cache_db)
 
 # Directories to overlay (will be mounted in RAM and actually used)
 # NOTE: Exclude large package/runtime directories to save RAM
@@ -72,7 +77,11 @@ check_root() {
 }
 
 is_active() {
-    [ -f "$STATE_FILE" ] && grep -q "active" "$STATE_FILE"
+    [ -f "$STATE_FILE" ] && grep -qxE "active|degraded" "$STATE_FILE"
+}
+
+is_degraded() {
+    [ -f "$STATE_FILE" ] && grep -qx "degraded" "$STATE_FILE"
 }
 
 is_file_in_use() {
@@ -223,17 +232,24 @@ cleanup_stale_files() {
     # Collecting all files first, then deleting in one rm invocation is 10-100x faster
     # than spawning a separate rm process for each file (especially for 100+ files)
     local files_to_delete=()
+
+    # Track in-use files we've already warned about this cleanup pass to prevent
+    # log flooding when the same file is held open across many cleanup cycles
+    local -A inuse_seen
     
     # Clean /tmp and /var/tmp
     for dir in /tmp /var/tmp; do
         [ -d "$dir" ] || continue
         while IFS= read -r -d '' file; do
             if is_file_in_use "$file"; then
-                log "Skipping in-use file: $file"
+                if [ -z "${inuse_seen[$file]+x}" ]; then
+                    log "Skipping in-use file: $file"
+                    inuse_seen[$file]=1
+                fi
             else
                 files_to_delete+=("$file")
             fi
-        done < <($FIND "$dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
+        done < <($FIND "$dir" -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
     done
 
     # Clean /var/cache (with exclusions)
@@ -250,12 +266,15 @@ cleanup_stale_files() {
             
             if [ $excluded -eq 0 ]; then
                 if is_file_in_use "$file"; then
-                    log "Skipping in-use cache file: $file"
+                    if [ -z "${inuse_seen[$file]+x}" ]; then
+                        log "Skipping in-use cache file: $file"
+                        inuse_seen[$file]=1
+                    fi
                 else
                     files_to_delete+=("$file")
                 fi
             fi
-        done < <($FIND /var/cache -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
+        done < <($FIND /var/cache -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
     fi
 
     # Clean user caches
@@ -279,20 +298,89 @@ cleanup_stale_files() {
             
             if [ $skip -eq 0 ]; then
                 if is_file_in_use "$file"; then
-                    log "Skipping in-use user cache: $file"
+                    if [ -z "${inuse_seen[$file]+x}" ]; then
+                        log "Skipping in-use user cache: $file"
+                        inuse_seen[$file]=1
+                    fi
                 else
                     files_to_delete+=("$file")
                 fi
             fi
-        done < <($FIND "$cache_dir" -mindepth 1 -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
+        done < <($FIND "$cache_dir" -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
     done <<< "$users"
     
     # Actually delete all collected files in batch
     if [ ${#files_to_delete[@]} -gt 0 ]; then
         log "Deleting ${#files_to_delete[@]} stale files..."
-        rm -rf "${files_to_delete[@]}" 2>/dev/null || true
+        rm -f "${files_to_delete[@]}" 2>/dev/null || true
         log "Cleanup complete"
     fi
+}
+
+start_inotify_watcher() {
+    if ! command -v inotifywait >/dev/null 2>&1; then
+        log "inotifywait not available - incremental sync disabled, using full rsync"
+        return 0
+    fi
+
+    # Collect upper dirs that actually exist
+    local watch_dirs=()
+    for dir in "${OVERLAY_DIRS[@]}"; do
+        local upper="$OVERLAY_BASE/upper${dir}"
+        mkdir -p "$upper"
+        watch_dirs+=("$upper")
+    done
+
+    [ ${#watch_dirs[@]} -eq 0 ] && return 0
+
+    # Start fresh queue
+    : > "$INOTIFY_QUEUE"
+
+    # Watch for all write-side events; output absolute path per line
+    $INOTIFYWAIT -m -r \
+        -e modify,create,delete,moved_to,moved_from \
+        --format '%w%f' \
+        "${watch_dirs[@]}" >> "$INOTIFY_QUEUE" 2>/dev/null &
+
+    echo $! > "$INOTIFY_PIDFILE"
+    log "inotify watcher started (PID: $!) tracking ${#watch_dirs[@]} upper dir(s)"
+}
+
+stop_inotify_watcher() {
+    if [ -f "$INOTIFY_PIDFILE" ]; then
+        local pid
+        pid=$(cat "$INOTIFY_PIDFILE")
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        rm -f "$INOTIFY_PIDFILE" "$INOTIFY_QUEUE"
+        log "inotify watcher stopped"
+    fi
+}
+
+# Returns 0 and prints newline-separated relative paths if the queue has entries
+# for the given upper_dir. Atomically rotates the queue so processed entries
+# are not re-synced on the next call.
+drain_inotify_queue() {
+    local upper_dir="$1"
+    local snap="${INOTIFY_QUEUE}.snap"
+
+    [ -f "$INOTIFY_QUEUE" ] || return 1
+    [ -s "$INOTIFY_QUEUE" ] || return 1
+
+    # Atomic snapshot — new events land in the fresh queue while we process snap
+    mv "$INOTIFY_QUEUE" "$snap"
+    : > "$INOTIFY_QUEUE"
+
+    # Extract unique relative paths under this upper dir
+    local result
+    result=$(grep -F "${upper_dir}/" "$snap" 2>/dev/null \
+        | sed "s|^${upper_dir}/||" \
+        | sort -u)
+
+    rm -f "$snap"
+
+    [ -n "$result" ] || return 1
+    echo "$result"
 }
 
 start_tmpfs_mounts() {
@@ -335,15 +423,17 @@ stop_tmpfs_mounts() {
 }
 
 get_available_ram() {
-    local total_kb=$(awk '/MemTotal/ {print int($2 * 0.9)}' /proc/meminfo)
-    local total_mb=$((total_kb / 1024))
+    local total_kb total_mb
+    total_kb=$(awk '/MemTotal/ {print int($2 * 0.9)}' /proc/meminfo)
+    total_mb=$((total_kb / 1024))
     echo "${total_mb}M"
 }
 
 create_overlay_base() {
     log "Creating RAM overlay base directory..."
     
-    local ram_size=$(get_available_ram)
+    local ram_size
+    ram_size=$(get_available_ram)
     log "Detected total RAM allocation: $ram_size (90% of total memory)"
     
     mkdir -p "$OVERLAY_BASE"
@@ -357,33 +447,45 @@ create_overlay_base() {
 
 create_directory_overlay() {
     local target_dir="$1"
-    local dir_name=$(echo "$target_dir" | tr '/' '_')
-    local upper_dir="$OVERLAY_BASE/upper${target_dir}"
-    local work_dir="$OVERLAY_BASE/work${target_dir}"
-    
+    local dir_name upper_dir work_dir
+    dir_name=$(echo "$target_dir" | tr '/' '_')
+    upper_dir="$OVERLAY_BASE/upper${target_dir}"
+    work_dir="$OVERLAY_BASE/work${target_dir}"
+
     # Create necessary directories for overlay mount
     mkdir -p "$upper_dir" "$work_dir"
-    
+
     # Check if already mounted
-    if mount | grep -q "overlay on $target_dir type overlay"; then
+    if mount | grep -q " on $target_dir type overlay"; then
         log "$target_dir already has overlay mounted, skipping"
         return 0
     fi
-    
+
     # Create the overlay mount directly over the original directory
     # Lower layer: original disk directory (read-only via overlay)
     # Upper layer: RAM storage for all modifications
     # Work layer: overlay filesystem internal use
     log "Mounting overlay on $target_dir..."
-    mount -t overlay overlay_${dir_name} \
-        -o lowerdir=$target_dir,upperdir=$upper_dir,workdir=$work_dir,metacopy=off \
-        "$target_dir" || {
-            log "ERROR: Failed to mount overlay on $target_dir"
-            return 1
-        }
-    
-    log "Successfully mounted RAM overlay on $target_dir"
-    return 0
+
+    # Try with metacopy=off first (preferred — avoids unnecessary metadata copies)
+    # Fall back without it for kernels that don't support the flag
+    if mount -t overlay "overlay_${dir_name}" \
+        -o "lowerdir=${target_dir},upperdir=${upper_dir},workdir=${work_dir},metacopy=off,noatime" \
+        "$target_dir" 2>/dev/null; then
+        log "Successfully mounted RAM overlay on $target_dir (metacopy=off)"
+        return 0
+    fi
+
+    log "WARNING: Mount with metacopy=off failed, retrying without it..."
+    if mount -t overlay "overlay_${dir_name}" \
+        -o "lowerdir=${target_dir},upperdir=${upper_dir},workdir=${work_dir},noatime" \
+        "$target_dir" 2>/dev/null; then
+        log "Successfully mounted RAM overlay on $target_dir (metacopy not supported on this kernel)"
+        return 0
+    fi
+
+    log "ERROR: Failed to mount overlay on $target_dir — writes will go directly to disk"
+    return 1
 }
 
 start_overlay() {
@@ -411,11 +513,16 @@ start_overlay() {
     done
     
     if [ $failed -gt 0 ]; then
-        log "WARNING: $failed overlay(s) failed to mount"
+        log "WARNING: $failed overlay(s) failed to mount — system running in degraded mode"
+        echo "degraded" > "$STATE_FILE"
+        echo "started=$(date +%s)" >> "$STATE_FILE"
+    else
+        echo "active" > "$STATE_FILE"
+        echo "started=$(date +%s)" >> "$STATE_FILE"
     fi
-    
-    echo "active" > "$STATE_FILE"
-    echo "started=$(date +%s)" >> "$STATE_FILE"
+
+    # Start incremental change tracking now that upper dirs exist
+    start_inotify_watcher
     
     log "RAM overlay system started successfully"
     log "Overlaid directories: ${OVERLAY_DIRS[*]}"
@@ -435,65 +542,115 @@ sync_changes() {
         log "RAM overlay is not active, nothing to sync"
         return 0
     fi
-    
+
     log "Syncing changes from RAM to disk..."
-    
-    local sync_failed=0
-    
+
+    local sync_dir_fail="/var/run/ramoverlay-syncfail"
+    rm -f "${sync_dir_fail}".*
+
+    # Determine whether incremental (inotify) or full rsync mode
+    local use_inotify=0
+    [ -f "$INOTIFY_PIDFILE" ] && kill -0 "$(cat "$INOTIFY_PIDFILE")" 2>/dev/null && use_inotify=1
+
+    # --- per-directory sync, run in parallel (#5) ---
     for dir in "${OVERLAY_DIRS[@]}"; do
-        local upper_dir="$OVERLAY_BASE/upper${dir}"
-        
-        if [ ! -d "$upper_dir" ]; then
-            log "No changes in $dir, skipping"
-            continue
-        fi
-        
-        # Check if there are any changes
-        if [ -z "$(ls -A "$upper_dir" 2>/dev/null)" ]; then
-            log "No changes in $dir, skipping"
-            continue
-        fi
-        
-        log "Syncing changes from $dir..."
-        
-        # Build exclude list
-        local exclude_opts=()
-        for excl in "${EXCLUDED_FROM_SYNC[@]}"; do
-            if [[ "$excl" == "$dir"* ]]; then
-                exclude_opts+=("--exclude=${excl#$dir/}")
+        (
+            local upper_dir="$OVERLAY_BASE/upper${dir}"
+            local fail_flag="${sync_dir_fail}.${dir//\//_}"
+
+            if [ ! -d "$upper_dir" ] || [ -z "$(ls -A "$upper_dir" 2>/dev/null)" ]; then
+                log "No changes in $dir, skipping"
+                exit 0
             fi
-        done
-        
-        # Must unmount overlay to access the real disk directory
-        # Otherwise rsync writes back to the overlay's upper layer (circular operation)
-        log "Unmounting overlay on $dir for sync..."
-        if ! umount_try "$dir"; then
-            log "ERROR: Failed to unmount $dir for syncing"
+
+            # Build exclude list
+            local exclude_opts=()
+            for excl in "${EXCLUDED_FROM_SYNC[@]}"; do
+                if [[ "$excl" == "$dir"* ]]; then
+                    exclude_opts+=("--exclude=${excl#$dir/}")
+                fi
+            done
+
+            # --- incremental path (#1) ---
+            if [ "$use_inotify" -eq 1 ]; then
+                local changed_files
+                if changed_files=$(drain_inotify_queue "$upper_dir"); then
+                    local count
+                    count=$(echo "$changed_files" | wc -l)
+                    log "Incremental sync of $dir ($count changed file(s) via inotify)..."
+
+                    # Unmount so rsync writes to real disk, not back into overlay
+                    if ! umount_try "$dir"; then
+                        log "ERROR: Failed to unmount $dir for incremental sync"
+                        touch "$fail_flag"
+                        exit 1
+                    fi
+
+                    local rsync_ok=0
+                    { $RSYNC -aAXH "${exclude_opts[@]}" \
+                        --files-from=<(echo "$changed_files") \
+                        "$upper_dir/" "$dir/" 2>&1 || rsync_ok=$?; } | tee -a "$LOG_FILE"
+
+                    if [ "$rsync_ok" -ne 0 ]; then
+                        log "ERROR: Incremental rsync failed for $dir (exit $rsync_ok)"
+                        touch "$fail_flag"
+                    else
+                        log "Incremental sync of $dir complete"
+                    fi
+
+                    if ! create_directory_overlay "$dir"; then
+                        log "ERROR: Failed to remount overlay on $dir after incremental sync"
+                        touch "$fail_flag"
+                    fi
+                    exit 0
+                fi
+                # Queue was empty for this dir — nothing to sync
+                log "No inotify-tracked changes in $dir, skipping"
+                exit 0
+            fi
+
+            # --- full rsync fallback ---
+            log "Full sync of $dir (no inotify)..."
+            if ! umount_try "$dir"; then
+                log "ERROR: Failed to unmount $dir for syncing"
+                touch "$fail_flag"
+                exit 1
+            fi
+
+            local rsync_ok=0
+            { $RSYNC -aAXHv "${exclude_opts[@]}" \
+                "$upper_dir/" "$dir/" 2>&1 || rsync_ok=$?; } | tee -a "$LOG_FILE"
+
+            if [ "$rsync_ok" -eq 0 ]; then
+                log "Successfully synced $dir"
+            else
+                log "ERROR: Failed to sync $dir (rsync exit code: $rsync_ok)"
+                touch "$fail_flag"
+            fi
+
+            if ! create_directory_overlay "$dir"; then
+                log "ERROR: Failed to remount overlay on $dir"
+                touch "$fail_flag"
+            fi
+        ) &
+    done
+
+    # Wait for all parallel syncs to complete (#5)
+    wait
+
+    sync
+
+    # Count failures via flag files
+    local sync_failed=0
+    for dir in "${OVERLAY_DIRS[@]}"; do
+        local fail_flag="${sync_dir_fail}.${dir//\//_}"
+        if [ -f "$fail_flag" ]; then
             sync_failed=$((sync_failed + 1))
-            continue
-        fi
-        
-        # Now sync changes from upper layer to the real disk directory
-        log "Syncing $dir from overlay to disk..."
-        if $RSYNC -aAXHv "${exclude_opts[@]}" \
-            "$upper_dir/" "$dir/" 2>&1 | tee -a "$LOG_FILE"; then
-            log "Successfully synced $dir"
-        else
-            log "ERROR: Failed to sync $dir (rsync exit code: $?)"
-            sync_failed=$((sync_failed + 1))
-        fi
-        
-        # Remount the overlay
-        log "Remounting overlay on $dir..."
-        if ! create_directory_overlay "$dir"; then
-            log "ERROR: Failed to remount overlay on $dir"
-            sync_failed=$((sync_failed + 1))
+            rm -f "$fail_flag"
         fi
     done
-    
-    sync
-    
-    if [ $sync_failed -gt 0 ]; then
+
+    if [ "$sync_failed" -gt 0 ]; then
         log "WARNING: $sync_failed directory sync(s) failed"
         return 1
     else
@@ -510,7 +667,11 @@ stop_overlay() {
     fi
     
     log "Stopping RAM overlay system..."
-    
+
+    # Stop the watcher before final sync so the queue captures all remaining events
+    # then is drained once, with no new events arriving mid-sync
+    stop_inotify_watcher
+
     # Sync changes first (this will unmount and remount overlays)
     sync_changes
     
@@ -518,7 +679,7 @@ stop_overlay() {
     log "Unmounting overlay filesystems..."
     for ((i=${#OVERLAY_DIRS[@]}-1; i>=0; i--)); do
         local dir="${OVERLAY_DIRS[i]}"
-        if mount | grep -q "overlay.*on $dir type overlay"; then
+        if mount | grep -q " on $dir type overlay"; then
             log "Unmounting overlay on $dir..."
             
             local upper_dir="$OVERLAY_BASE/upper${dir}"
@@ -531,9 +692,11 @@ stop_overlay() {
                 if umount_try "$dir"; then
                     # Sync changes directly from upper layer to real directory
                     log "Syncing changes from overlay to disk for $dir..."
-                    $RSYNC -aAXH "$upper_dir/" "$dir/" 2>&1 | tee -a "$LOG_FILE" || {
+                    local sync_rc=0
+                    { $RSYNC -aAXH "$upper_dir/" "$dir/" 2>&1 || sync_rc=$?; } | tee -a "$LOG_FILE"
+                    if [ "$sync_rc" -ne 0 ]; then
                         log "ERROR: Failed final sync of $dir"
-                    }
+                    fi
                 else
                     log "ERROR: Failed to unmount $dir"
                 fi
@@ -563,9 +726,9 @@ get_logged_in_users() {
     # Check who command
     count=$(who | awk '{print $1}' | sort -u | wc -l)
     
-    # If no users from who, check for X sessions
+    # If no users from who, check for X sessions (count only sockets)
     if [ $count -eq 0 ] && [ -d /tmp/.X11-unix ]; then
-        count=$(ls -1 /tmp/.X11-unix/ 2>/dev/null | wc -l)
+        count=$(find /tmp/.X11-unix -maxdepth 1 -name 'X*' -type s 2>/dev/null | wc -l)
     fi
     
     echo $count
@@ -575,7 +738,8 @@ wait_for_login() {
     log "Waiting for user login..."
     
     while true; do
-        local users=$(get_logged_in_users)
+        local users
+        users=$(get_logged_in_users)
         
         if [ "$users" -gt 0 ]; then
             log "User login detected ($users users)"
@@ -588,7 +752,6 @@ wait_for_login() {
 
 shutdown_cleanup() {
     log "Shutdown/reboot signal received - syncing all changes to disk..."
-    sync_changes
     stop_overlay
     rm -f "$DAEMON_PIDFILE"
     log "Shutdown sync complete - exiting"
@@ -597,8 +760,8 @@ shutdown_cleanup() {
 
 check_root
 
-if [ -f "$DAEMON_PIDFILE" ] && kill -0 $(cat "$DAEMON_PIDFILE") 2>/dev/null; then
-    log "Already running with PID $(cat $DAEMON_PIDFILE) - exiting"
+if [ -f "$DAEMON_PIDFILE" ] && kill -0 "$(cat "$DAEMON_PIDFILE")" 2>/dev/null; then
+    log "Already running with PID $(cat "$DAEMON_PIDFILE") - exiting"
     exit 0
 fi
 
@@ -619,12 +782,15 @@ while true; do
     sleep 3
     
     log "Starting RAM overlay system..."
-    start_overlay
-    
-    if [ $? -eq 0 ]; then
-        log "RAM overlay started successfully"
-        log "System is now running with RAM-backed directories"
-        log "Check 'mount | grep overlay' to see active overlays"
+    if start_overlay; then
+        if is_degraded; then
+            log "WARNING: RAM overlay started in DEGRADED mode — one or more overlays failed to mount"
+            log "Writes to failed directories are going directly to disk"
+        else
+            log "RAM overlay started successfully"
+            log "System is now running with RAM-backed directories"
+            log "Check 'mount | grep overlay' to see active overlays"
+        fi
     else
         log "ERROR: Failed to start RAM overlay - will retry on next login"
         sleep 5
@@ -641,9 +807,7 @@ while true; do
     sleep 2
     
     log "Stopping and syncing RAM overlay..."
-    stop_overlay
-    
-    if [ $? -eq 0 ]; then
+    if stop_overlay; then
         log "RAM overlay stopped and synced successfully"
     else
         log "ERROR: Issues during RAM overlay shutdown"
