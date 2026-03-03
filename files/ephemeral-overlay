@@ -717,6 +717,12 @@ stop_overlay() {
     stop_tmpfs_mounts
     
     log "RAM overlay system stopped - RAM freed"
+
+    # Truncate log so next boot starts fresh — archive last session first
+    # so the final shutdown messages are preserved if needed for debugging
+    local archive="/var/log/ramoverlay.last.log"
+    cp "$LOG_FILE" "$archive" 2>/dev/null || true
+    : > "$LOG_FILE"
 }
 
 get_logged_in_users() {
