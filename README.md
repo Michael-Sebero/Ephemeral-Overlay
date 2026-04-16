@@ -46,7 +46,7 @@ Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync` and `find
 
 ## Requirements
 
-* **Commands:** `rsync` (falls back to `mv`), and `lsof` or `fuser` (falls back to `/proc` scanning) — none are hard requirements but `rsync` is strongly recommended for safe syncing
+* **Commands:** `rsync` (falls back to `mv`), and `lsof` or `fuser` (falls back to `/proc` scanning) - none are hard requirements but `rsync` is strongly recommended for safe syncing
 * **RAM:** 16GB+ recommended (typical usage: 200MB-2GB)
 * **Filesystem:** Supports OverlayFS (ext4, btrfs, xfs, f2fs)
 * **Optional:** `libmimalloc.so` for faster syncs
@@ -166,5 +166,5 @@ tail -f /var/log/ramoverlay.log
 * **File-in-use detection:** Never deletes files that are currently open
 * **Rsync verification:** Checks rsync exit codes (captured independently of `tee`) and logs sync failures
 * **Protected directories:** User data in `/home` is never overlaid
-* **OverlayFS semantics:** Per-file writes are atomic via OverlayFS; however, the sync process (unmount → rsync → remount) is not crash-safe — a power loss mid-sync may leave the filesystem partially written
+* **OverlayFS semantics:** Per-file writes are atomic via OverlayFS; however, the sync process (unmount → rsync → remount) is not crash-safe - a power loss mid-sync may leave the filesystem partially written
 * **Fallback mechanisms:** Multiple methods for file-in-use detection
