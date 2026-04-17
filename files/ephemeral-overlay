@@ -461,6 +461,23 @@ create_directory_overlay() {
         return 0
     fi
 
+    # Pre-populate the upper layer with the lower layer's contents before mounting.
+    #
+    # Without this, overlayfs uses lazy copy-up: a file that exists only in the
+    # lower layer is readable but returns EPERM on lstat() in certain kernel/tool
+    # combinations (notably pacman's pre-write stat check). This causes spurious
+    # "Could not stat" errors when reinstalling packages whose config files were
+    # never modified (and therefore never copy-up'd into the upper layer).
+    #
+    # --ignore-existing preserves any changes already in the upper layer from a
+    # previous session that were synced back to disk and are now in the lower layer.
+    # --archive preserves permissions, timestamps, symlinks, and xattrs (-aAX).
+    # We intentionally skip --delete so stale upper-layer entries are left in place
+    # (they are either valid changes or harmless; the overlay will mask them anyway).
+    log "Pre-populating upper layer for $target_dir (ensures full stat visibility)..."
+    $RSYNC -aAX --ignore-existing "$target_dir/" "$upper_dir/" 2>/dev/null || \
+        log "WARNING: Pre-population rsync for $target_dir had errors (non-fatal)"
+
     # Create the overlay mount directly over the original directory
     # Lower layer: original disk directory (read-only via overlay)
     # Upper layer: RAM storage for all modifications
