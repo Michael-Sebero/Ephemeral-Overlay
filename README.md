@@ -62,28 +62,16 @@ Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync`, `find`, 
 ```bash
 sudo cp ephemeral-overlay /bin/
 sudo chmod 755 /bin/ephemeral-overlay
+sudo /bin/ephemeral-overlay
 ```
 
-**On OpenRC / SysV-style systems**, add to `/etc/rc.local`:
+**On rc.local systems**, add to `/etc/rc.local`:
 
 ```bash
 # Start ephemeral overlay daemon
 if [ -x /bin/ephemeral-overlay ]; then
     ( sleep 20; setsid nohup /bin/ephemeral-overlay >> /var/log/ramoverlay.log 2>&1 ) &
 fi
-```
-
-**On s6**, this daemon is built to be supervised directly rather than backgrounded — it already runs in the foreground forever, handles its own login/logout polling, and traps `SIGTERM`/`SIGINT`/`SIGHUP`/`EXIT` to sync before exiting. That means s6 can restart it automatically if it ever dies unexpectedly, which the `rc.local`/`nohup` approach above can't do. A `longrun` service directory looks like:
-
-```bash
-mkdir -p /etc/s6-rc/source/ramoverlay
-echo longrun > /etc/s6-rc/source/ramoverlay/type
-cat > /etc/s6-rc/source/ramoverlay/run <<'EOF'
-#!/bin/execlineb -P
-fdmove -c 2 1
-/bin/ephemeral-overlay
-EOF
-chmod +x /etc/s6-rc/source/ramoverlay/run
 ```
 
 Registering and enabling it (compiling the service database, adding it to whatever bundle your other longruns are in) is the part that varies by Artix's `s6-rc` frontend version — use the same `s6 set` / `s6 live install` workflow you've already got working for other services rather than any specific commands here, and confirm with `s6-rc-db list` (or your usual check) that it's actually running before trusting it.
