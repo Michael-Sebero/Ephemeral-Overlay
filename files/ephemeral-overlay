@@ -29,9 +29,17 @@ TMP_SIZE="5G"
 VAR_TMP_SIZE="1G"
 VAR_CACHE_SIZE="2G"
 USER_CACHE_SIZE="2G"
+OVERLAY_BASE_SIZE="90%"   # tmpfs supports a %-of-physical-RAM size directly
 
 CLEAN_INTERVAL=30
 STALE_MINUTES=5
+
+# How often to sync RAM -> disk while a session stays open, in addition to
+# the sync that always happens at logout/shutdown. 0 disables. This is cheap
+# now that sync_changes() actually does incremental syncs (see audit notes
+# below) -- it only costs real work when something changed since the last
+# pass, so it's safe to leave on.
+SYNC_INTERVAL=300
 
 PERSIST_ROOT="/persist"
 
@@ -40,6 +48,9 @@ BIND_MOUNTED_USER_CACHE=(nvidia mesa_shader_cache mesa_shader_cache_db)
 
 # Directories to overlay (will be mounted in RAM and actually used)
 # NOTE: Exclude large package/runtime directories to save RAM
+# NOTE: entries must not be nested (no entry may be a parent/child of
+# another) -- the inotify queue filtering in sync_changes() matches by
+# literal path prefix and assumes OVERLAY_DIRS entries don't overlap.
 OVERLAY_DIRS=(
     "/etc"
     "/var/log"
@@ -49,7 +60,12 @@ OVERLAY_DIRS=(
     # "/usr/local"
 )
 
-# Directories to completely exclude from overlay
+# Directories to completely exclude from overlay sync AND from the eager
+# upper-layer pre-population copy-up (see create_directory_overlay). An
+# entry only has any effect if it falls under one of OVERLAY_DIRS above --
+# "/var/lib/systemd" below currently doesn't (only /etc and /var/log are
+# overlaid), so it's a no-op today; left in place in case /var/lib is
+# overlaid later.
 EXCLUDED_FROM_SYNC=(
     "/var/lib/systemd"
     "/var/log/journal"
@@ -62,8 +78,6 @@ if command -v lsof >/dev/null 2>&1; then
 elif command -v fuser >/dev/null 2>&1; then
     USE_FUSER=1
 fi
-
-timestamp() { date +"%Y-%m-%dT%H:%M:%S%z"; }
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
@@ -84,24 +98,79 @@ is_degraded() {
     [ -f "$STATE_FILE" ] && grep -qx "degraded" "$STATE_FILE"
 }
 
+# Builds rsync --exclude= flags for any EXCLUDED_FROM_SYNC entry that falls
+# under $1, expressed relative to $1. Shared by create_directory_overlay's
+# pre-population copy-up and sync_changes's write-back, so both agree on
+# what "excluded" means instead of the same matching logic being maintained
+# in two places.
+compute_exclude_opts() {
+    local dir="$1"
+    local excl
+    for excl in "${EXCLUDED_FROM_SYNC[@]}"; do
+        if [[ "$excl" == "$dir"* ]]; then
+            echo "--exclude=${excl#"$dir"/}"
+        fi
+    done
+}
+
+# --- In-use file detection --------------------------------------------------
+#
+# Checking whether a candidate file is open used to mean forking lsof/fuser
+# (or, lacking both, walking every /proc/*/fd symlink with a separate forked
+# `readlink` call) FOR EACH candidate file individually. On a cleanup pass
+# with a few hundred stale files that's a few hundred forks of a tool that
+# itself scans the whole system's open-file table each time -- easily slower
+# than CLEAN_INTERVAL itself under load. INUSE_SET is built ONCE per cleanup
+# pass instead, so checking a candidate afterward is an O(1) hash lookup.
+
+declare -A INUSE_SET
+
+build_inuse_index() {
+    INUSE_SET=()
+
+    if [ "$USE_LSOF" -eq 1 ]; then
+        # -Fn: one 'n<path>' line per open file, one invocation total,
+        # regardless of how many candidates we're about to check.
+        local line
+        while IFS= read -r line; do
+            [ "${line:0:1}" = "n" ] && INUSE_SET["${line:1}"]=1
+        done < <(lsof -Fn 2>/dev/null)
+        return 0
+    fi
+
+    if [ "$USE_FUSER" -eq 1 ]; then
+        # fuser has no reliable "list everything currently open" primitive to
+        # batch against (its multi-file output isn't something to parse with
+        # confidence across psmisc versions/locales), so this tier keeps the
+        # original one-call-per-file check in is_file_in_use() below. This
+        # path only matters on a system with fuser but no lsof; lsof is
+        # essentially always present on a dev/gaming workstation, so the
+        # fast path above is the one that actually matters in practice.
+        return 0
+    fi
+
+    # No lsof, no fuser: resolve every /proc/*/fd symlink with ONE batched
+    # readlink call instead of forking readlink separately per fd.
+    local fds=(/proc/[0-9]*/fd/*)
+    [ -e "${fds[0]}" ] || return 0
+    local target
+    while IFS= read -r target; do
+        [ -n "$target" ] && INUSE_SET["$target"]=1
+    done < <(readlink -f -- "${fds[@]}" 2>/dev/null)
+}
+
 is_file_in_use() {
     local file="$1"
     [ -e "$file" ] || return 1
-    if [ "$USE_LSOF" -eq 1 ]; then
-        lsof -t -- "$file" >/dev/null 2>&1 && return 0 || return 1
-    elif [ "$USE_FUSER" -eq 1 ]; then
-        fuser -s -- "$file" >/dev/null 2>&1 && return 0 || return 1
-    else
-        local t
-        t="$(readlink -f -- "$file")" || return 1
-        for fd in /proc/[0-9]*/fd/*; do
-            [ -e "$fd" ] || continue
-            local link
-            link="$(readlink -f -- "$fd" 2>/dev/null)" || continue
-            [ "$link" = "$t" ] && return 0
-        done
+
+    if [ "$USE_FUSER" -eq 1 ] && [ "$USE_LSOF" -ne 1 ]; then
+        fuser -s -- "$file" >/dev/null 2>&1
+        return $?
     fi
-    return 1
+
+    local real
+    real="$(readlink -f -- "$file" 2>/dev/null)" || real="$file"
+    [ -n "${INUSE_SET[$real]+x}" ]
 }
 
 mount_tmpfs() {
@@ -112,38 +181,75 @@ mount_tmpfs() {
         return 0
     fi
     log "Mounting tmpfs on $dir (size=$size mode=$mode)..."
-    mount -t tmpfs -o "size=${size},mode=${mode}" none "$dir"
+    # noswap (kernel 6.3+) keeps this tmpfs's pages from being pushed to
+    # swap under memory pressure -- without it, a "RAM-backed" directory can
+    # silently start costing swap I/O, which is worse than not having the
+    # overlay at all. Falls back cleanly on older kernels.
+    if mount -t tmpfs -o "size=${size},mode=${mode},noswap" none "$dir" 2>/dev/null; then
+        return 0
+    fi
+    if mount -t tmpfs -o "size=${size},mode=${mode}" none "$dir"; then
+        return 0
+    fi
+    log "ERROR: Failed to mount tmpfs on $dir"
+    return 1
 }
 
-bind_persistent_dirs() {
+# Moves any pre-existing content at $parent/$d into $PERSIST_ROOT/$parent/$d,
+# for each $d in the given list. MUST be called BEFORE $parent is covered by
+# a tmpfs mount: once tmpfs is mounted over $parent, the real on-disk content
+# is masked, so this function would see an empty directory and never migrate
+# anything. (This was a real bug: migration used to run after the tmpfs
+# mount was already in place over /var/cache and each user's ~/.cache, so it
+# silently never fired -- pre-existing pacman cache, and more importantly
+# nvidia/mesa shader caches, were masked rather than migrated on first run.)
+migrate_to_persist() {
     local parent="$1"
     shift
     local dirs=("$@")
     local persist_root="${PERSIST_ROOT}${parent}"
     mkdir -p "$persist_root" || { log "ERROR: failed to mkdir $persist_root"; return 1; }
 
+    local d
     for d in "${dirs[@]}"; do
         local src="$persist_root/$d"
         local dest="$parent/$d"
 
-        if [ -d "$dest" ] && [ ! -e "$src" ]; then
+        if [ -d "$dest" ] && [ ! -e "$src" ] && [ -n "$(ls -A "$dest" 2>/dev/null || true)" ]; then
+            log "Moving existing $dest -> $src (first-run persistence)"
             mkdir -p "$(dirname "$src")"
-            if [ "$(ls -A "$dest" 2>/dev/null || true)" != "" ]; then
-                log "Moving existing $dest -> $src (first-run persistence)"
-                if command -v rsync >/dev/null 2>&1; then
-                    $RSYNC -a --remove-source-files "$dest"/ "$src"/ || true
-                    $FIND "$dest" -mindepth 1 -type d -empty -delete || true
-                else
-                    mv "$dest" "$src" || true
-                fi
+            if command -v rsync >/dev/null 2>&1; then
+                $RSYNC -a --remove-source-files "$dest"/ "$src"/ || true
+                $FIND "$dest" -mindepth 1 -type d -empty -delete || true
+            else
+                mv "$dest" "$src" || true
             fi
         fi
+    done
+}
+
+# Bind-mounts $PERSIST_ROOT/$parent/$d onto $parent/$d for each $d. Call
+# AFTER $parent has been tmpfs-mounted (and after migrate_to_persist has
+# already run against the real, pre-tmpfs $parent).
+bind_persist_dirs() {
+    local parent="$1"
+    shift
+    local dirs=("$@")
+    local persist_root="${PERSIST_ROOT}${parent}"
+
+    local d
+    for d in "${dirs[@]}"; do
+        local src="$persist_root/$d"
+        local dest="$parent/$d"
 
         mkdir -p "$src" "$dest"
-        
+
         if ! mountpoint -q "$dest"; then
-            mount --bind "$src" "$dest"
-            log "Bind-mounted $src -> $dest"
+            if mount --bind "$src" "$dest"; then
+                log "Bind-mounted $src -> $dest"
+            else
+                log "ERROR: Failed to bind-mount $src -> $dest"
+            fi
         else
             log "$dest already a mountpoint, skipping bind."
         fi
@@ -154,7 +260,7 @@ mount_user_caches() {
     local users
     users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }')
     while IFS=: read -r username homedir; do
-        [ -n "$username" ] && [ -n "$homedir" ] || continue
+        if [ -z "$username" ] || [ -z "$homedir" ]; then continue; fi
         [ -d "$homedir" ] || continue
         local cache_dir="$homedir/.cache"
         local user_stat
@@ -173,15 +279,33 @@ mount_user_caches() {
             continue
         fi
 
+        # Migrate pre-existing driver/shader caches BEFORE the tmpfs mount
+        # below would otherwise mask them (see migrate_to_persist notes).
+        migrate_to_persist "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
+
         log "Mounting tmpfs on $cache_dir (size=$USER_CACHE_SIZE) for $username..."
-        mount -t tmpfs -o "size=${USER_CACHE_SIZE},mode=0700,uid=${uid},gid=${gid}" none "$cache_dir"
-        
-        bind_persistent_dirs "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
-        
+        if ! mount -t tmpfs -o "size=${USER_CACHE_SIZE},mode=0700,uid=${uid},gid=${gid},noswap" none "$cache_dir" 2>/dev/null; then
+            if ! mount -t tmpfs -o "size=${USER_CACHE_SIZE},mode=0700,uid=${uid},gid=${gid}" none "$cache_dir"; then
+                log "ERROR: Failed to mount tmpfs cache for $username - leaving ~/.cache on disk"
+                continue
+            fi
+        fi
+
+        bind_persist_dirs "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
+
         chown "${uid}:${gid}" "$cache_dir" || true
+        local subdir
         for subdir in "${BIND_MOUNTED_USER_CACHE[@]}"; do
-            if [ -d "$cache_dir/$subdir" ]; then
-                chown -R "${uid}:${gid}" "$cache_dir/$subdir" || true
+            local d="$cache_dir/$subdir"
+            if [ -d "$d" ]; then
+                local cur_owner
+                cur_owner=$(stat -c "%u:%g" "$d" 2>/dev/null) || cur_owner=""
+                # Skip the recursive walk when ownership is already correct
+                # -- shader caches can be large, and chown -R over them on
+                # every login when nothing needs changing is wasted work.
+                if [ "$cur_owner" != "${uid}:${gid}" ]; then
+                    chown -R "${uid}:${gid}" "$d" || true
+                fi
             fi
         done
     done <<< "$users"
@@ -206,7 +330,7 @@ umount_user_caches() {
     local users
     users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $6 }')
     while read -r homedir; do
-        [ -n "$homedir" ] && [ -d "$homedir" ] || continue
+        if [ -z "$homedir" ] || [ ! -d "$homedir" ]; then continue; fi
         local cache_dir="$homedir/.cache"
         for ((i=${#BIND_MOUNTED_USER_CACHE[@]}-1; i>=0; i--)); do
             umount_try "$cache_dir/${BIND_MOUNTED_USER_CACHE[i]}" || true
@@ -224,95 +348,81 @@ umount_var_cache() {
 
 cleanup_stale_files() {
     local var_cache_excludes=()
-    for dir in "${BIND_MOUNTED_VAR_CACHE[@]}"; do
-        var_cache_excludes+=("/var/cache/$dir")
+    local vcdir
+    for vcdir in "${BIND_MOUNTED_VAR_CACHE[@]}"; do
+        var_cache_excludes+=("/var/cache/$vcdir")
     done
 
-    # PERFORMANCE OPTIMIZATION: Batch file deletions to minimize process spawning overhead
-    # Collecting all files first, then deleting in one rm invocation is 10-100x faster
-    # than spawning a separate rm process for each file (especially for 100+ files)
-    local files_to_delete=()
+    # Phase 1: collect every stale-by-mtime candidate first, with NO in-use
+    # check yet -- that happens once, in bulk, in phase 2.
+    local candidates=()
 
-    # Track in-use files we've already warned about this cleanup pass to prevent
-    # log flooding when the same file is held open across many cleanup cycles
-    local -A inuse_seen
-    
-    # Clean /tmp and /var/tmp
+    local dir
     for dir in /tmp /var/tmp; do
         [ -d "$dir" ] || continue
         while IFS= read -r -d '' file; do
-            if is_file_in_use "$file"; then
-                if [ -z "${inuse_seen[$file]+x}" ]; then
-                    log "Skipping in-use file: $file"
-                    inuse_seen[$file]=1
-                fi
-            else
-                files_to_delete+=("$file")
-            fi
+            candidates+=("$file")
         done < <($FIND "$dir" -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
     done
 
-    # Clean /var/cache (with exclusions)
     if [ -d /var/cache ]; then
         while IFS= read -r -d '' file; do
-            # Check exclusions
             local excluded=0
+            local ex
             for ex in "${var_cache_excludes[@]}"; do
                 if [[ "$file" == "$ex"* ]]; then
                     excluded=1
                     break
                 fi
             done
-            
-            if [ $excluded -eq 0 ]; then
-                if is_file_in_use "$file"; then
-                    if [ -z "${inuse_seen[$file]+x}" ]; then
-                        log "Skipping in-use cache file: $file"
-                        inuse_seen[$file]=1
-                    fi
-                else
-                    files_to_delete+=("$file")
-                fi
-            fi
+            [ $excluded -eq 0 ] && candidates+=("$file")
         done < <($FIND /var/cache -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
     fi
 
-    # Clean user caches
     local users
     users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $6 }')
     while read -r homedir; do
-        [ -n "$homedir" ] && [ -d "$homedir" ] || continue
+        if [ -z "$homedir" ] || [ ! -d "$homedir" ]; then continue; fi
         local cache_dir="$homedir/.cache"
         [ -d "$cache_dir" ] || continue
-        
-        # Collect user cache files
+
         while IFS= read -r -d '' file; do
-            # Skip bind-mounted persistent directories
             local skip=0
+            local bd
             for bd in "${BIND_MOUNTED_USER_CACHE[@]}"; do
                 if [[ "$file" == "$cache_dir/$bd"* ]]; then
                     skip=1
                     break
                 fi
             done
-            
-            if [ $skip -eq 0 ]; then
-                if is_file_in_use "$file"; then
-                    if [ -z "${inuse_seen[$file]+x}" ]; then
-                        log "Skipping in-use user cache: $file"
-                        inuse_seen[$file]=1
-                    fi
-                else
-                    files_to_delete+=("$file")
-                fi
-            fi
+            [ $skip -eq 0 ] && candidates+=("$file")
         done < <($FIND "$cache_dir" -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
     done <<< "$users"
-    
-    # Actually delete all collected files in batch
+
+    [ ${#candidates[@]} -eq 0 ] && return 0
+
+    # Phase 2: ONE pass to learn which candidates are open, instead of
+    # forking lsof/fuser (or walking all of /proc) once per candidate.
+    build_inuse_index
+
+    local files_to_delete=()
+    local file
+    for file in "${candidates[@]}"; do
+        if is_file_in_use "$file"; then
+            log "Skipping in-use file: $file"
+        else
+            files_to_delete+=("$file")
+        fi
+    done
+
+    # Phase 3: batch-delete, chunked via xargs so a very large batch can't
+    # exceed ARG_MAX and silently delete nothing (a bare `rm -f "${arr[@]}"`
+    # would fail outright on a big enough batch, and the failure was being
+    # swallowed by `|| true` -- exactly the case the batching was meant to
+    # help with).
     if [ ${#files_to_delete[@]} -gt 0 ]; then
         log "Deleting ${#files_to_delete[@]} stale files..."
-        rm -f "${files_to_delete[@]}" 2>/dev/null || true
+        printf '%s\0' "${files_to_delete[@]}" | xargs -0 -r rm -f -- 2>/dev/null || true
         log "Cleanup complete"
     fi
 }
@@ -325,6 +435,7 @@ start_inotify_watcher() {
 
     # Collect upper dirs that actually exist
     local watch_dirs=()
+    local dir
     for dir in "${OVERLAY_DIRS[@]}"; do
         local upper="$OVERLAY_BASE/upper${dir}"
         mkdir -p "$upper"
@@ -357,55 +468,21 @@ stop_inotify_watcher() {
     fi
 }
 
-# Returns 0 and prints newline-separated relative paths if the queue has entries
-# for the given upper_dir. Atomically rotates the queue so processed entries
-# are not re-synced on the next call.
-drain_inotify_queue() {
-    local upper_dir="$1"
-    local snap="${INOTIFY_QUEUE}.snap"
-
-    [ -f "$INOTIFY_QUEUE" ] || return 1
-    [ -s "$INOTIFY_QUEUE" ] || return 1
-
-    # Atomic snapshot — new events land in the fresh queue while we process snap
-    mv "$INOTIFY_QUEUE" "$snap"
-    : > "$INOTIFY_QUEUE"
-
-    # Extract unique relative paths under this upper dir
-    local result
-    result=$(grep -F "${upper_dir}/" "$snap" 2>/dev/null \
-        | sed "s|^${upper_dir}/||" \
-        | sort -u)
-
-    rm -f "$snap"
-
-    [ -n "$result" ] || return 1
-    echo "$result"
-}
-
 start_tmpfs_mounts() {
     log "Starting tmpfs mounts..."
-    
-    mkdir -p "$PERSIST_ROOT"
-    
-    mount_tmpfs /tmp "$TMP_SIZE" 1777
-    mount_tmpfs /var/tmp "$VAR_TMP_SIZE" 1777
-    mount_tmpfs /var/cache "$VAR_CACHE_SIZE" 0755
 
-    bind_persistent_dirs /var/cache "${BIND_MOUNTED_VAR_CACHE[@]}"
+    mkdir -p "$PERSIST_ROOT"
+
+    # Migrate pre-existing content BEFORE mount_tmpfs below hides it.
+    migrate_to_persist /var/cache "${BIND_MOUNTED_VAR_CACHE[@]}"
+
+    mount_tmpfs /tmp "$TMP_SIZE" 1777 || log "WARNING: /tmp will remain on disk"
+    mount_tmpfs /var/tmp "$VAR_TMP_SIZE" 1777 || log "WARNING: /var/tmp will remain on disk"
+    mount_tmpfs /var/cache "$VAR_CACHE_SIZE" 0755 || log "WARNING: /var/cache will remain on disk"
+
+    bind_persist_dirs /var/cache "${BIND_MOUNTED_VAR_CACHE[@]}"
     mount_user_caches
 
-    getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }' | \
-    while IFS=: read -r username homedir; do
-        [ -d "$homedir" ] || continue
-        if [ -d "$homedir/.cache" ]; then
-            uidgid=$(stat -c "%u:%g" "$homedir")
-            chown "$uidgid" "$homedir/.cache" || true
-            chmod 0700 "$homedir/.cache" || true
-            log "Fixed perms for $homedir/.cache"
-        fi
-    done
-    
     log "tmpfs mounts completed."
 }
 
@@ -413,40 +490,41 @@ stop_tmpfs_mounts() {
     log "Stopping tmpfs mounts..."
     log "Syncing filesystem..."
     sync
-    
+
     umount_user_caches
     umount_var_cache
     umount_try /var/tmp || true
     umount_try /tmp || true
-    
-    log "tmpfs mounts stopped."
-}
 
-get_available_ram() {
-    local total_kb total_mb
-    total_kb=$(awk '/MemTotal/ {print int($2 * 0.9)}' /proc/meminfo)
-    total_mb=$((total_kb / 1024))
-    echo "${total_mb}M"
+    log "tmpfs mounts stopped."
 }
 
 create_overlay_base() {
     log "Creating RAM overlay base directory..."
-    
-    local ram_size
-    ram_size=$(get_available_ram)
-    log "Detected total RAM allocation: $ram_size (90% of total memory)"
-    
+
     mkdir -p "$OVERLAY_BASE"
-    
-    if ! mountpoint -q "$OVERLAY_BASE"; then
-        mount -t tmpfs -o size=$ram_size,mode=0755 tmpfs "$OVERLAY_BASE" || \
-            { log "ERROR: Failed to mount tmpfs at $OVERLAY_BASE"; return 1; }
-        log "Mounted tmpfs at $OVERLAY_BASE with size $ram_size"
+
+    if mountpoint -q "$OVERLAY_BASE"; then
+        return 0
     fi
+
+    if mount -t tmpfs -o "size=${OVERLAY_BASE_SIZE},mode=0755,noswap" tmpfs "$OVERLAY_BASE" 2>/dev/null; then
+        log "Mounted tmpfs at $OVERLAY_BASE (size=$OVERLAY_BASE_SIZE of RAM)"
+        return 0
+    fi
+
+    if mount -t tmpfs -o "size=${OVERLAY_BASE_SIZE},mode=0755" tmpfs "$OVERLAY_BASE"; then
+        log "Mounted tmpfs at $OVERLAY_BASE (size=$OVERLAY_BASE_SIZE of RAM, noswap unsupported on this kernel)"
+        return 0
+    fi
+
+    log "ERROR: Failed to mount tmpfs at $OVERLAY_BASE"
+    return 1
 }
 
 create_directory_overlay() {
     local target_dir="$1"
+    local prepopulate="${2:-1}"
     local dir_name upper_dir work_dir
     dir_name=$(echo "$target_dir" | tr '/' '_')
     upper_dir="$OVERLAY_BASE/upper${target_dir}"
@@ -455,28 +533,48 @@ create_directory_overlay() {
     # Create necessary directories for overlay mount
     mkdir -p "$upper_dir" "$work_dir"
 
-    # Check if already mounted
-    if mount | grep -q " on $target_dir type overlay"; then
+    # Check if already mounted (findmnt does a single targeted lookup rather
+    # than listing every mount and grepping it)
+    if [ "$(findmnt -n -o FSTYPE --target "$target_dir" 2>/dev/null)" = "overlay" ]; then
         log "$target_dir already has overlay mounted, skipping"
         return 0
     fi
 
-    # Pre-populate the upper layer with the lower layer's contents before mounting.
-    #
-    # Without this, overlayfs uses lazy copy-up: a file that exists only in the
-    # lower layer is readable but returns EPERM on lstat() in certain kernel/tool
-    # combinations (notably pacman's pre-write stat check). This causes spurious
-    # "Could not stat" errors when reinstalling packages whose config files were
-    # never modified (and therefore never copy-up'd into the upper layer).
-    #
-    # --ignore-existing preserves any changes already in the upper layer from a
-    # previous session that were synced back to disk and are now in the lower layer.
-    # --archive preserves permissions, timestamps, symlinks, and xattrs (-aAX).
-    # We intentionally skip --delete so stale upper-layer entries are left in place
-    # (they are either valid changes or harmless; the overlay will mask them anyway).
-    log "Pre-populating upper layer for $target_dir (ensures full stat visibility)..."
-    $RSYNC -aAX --ignore-existing "$target_dir/" "$upper_dir/" 2>/dev/null || \
-        log "WARNING: Pre-population rsync for $target_dir had errors (non-fatal)"
+    if [ "$prepopulate" -eq 1 ]; then
+        # Pre-populate the upper layer with the lower layer's contents before
+        # mounting.
+        #
+        # Without this, overlayfs uses lazy copy-up: a file that exists only
+        # in the lower layer is readable but returns EPERM on lstat() in
+        # certain kernel/tool combinations (notably pacman's pre-write stat
+        # check). This causes spurious "Could not stat" errors when
+        # reinstalling packages whose config files were never modified (and
+        # therefore never copy-up'd into the upper layer).
+        #
+        # --ignore-existing preserves any changes already in the upper layer
+        # from a previous session that were synced back to disk and are now
+        # in the lower layer. --archive preserves permissions, timestamps,
+        # symlinks, and xattrs (-aAX). We intentionally skip --delete so
+        # stale upper-layer entries are left in place (they are either valid
+        # changes or harmless; the overlay will mask them anyway).
+        #
+        # EXCLUDED_FROM_SYNC paths are skipped here too: they're never
+        # written back to disk by sync_changes, so eagerly copying them into
+        # RAM on every first mount (e.g. the systemd journal under
+        # /var/log) would burn RAM and time for data that can never
+        # round-trip anyway. Anything under an excluded path that's actually
+        # written during the session still gets copied up lazily by the
+        # kernel's normal overlay copy-up path -- this just stops eagerly
+        # bulk-copying it up front.
+        local exclude_opts=()
+        while IFS= read -r opt; do
+            exclude_opts+=("$opt")
+        done < <(compute_exclude_opts "$target_dir")
+
+        log "Pre-populating upper layer for $target_dir (ensures full stat visibility)..."
+        $RSYNC -aAX --ignore-existing "${exclude_opts[@]}" "$target_dir/" "$upper_dir/" 2>/dev/null || \
+            log "WARNING: Pre-population rsync for $target_dir had errors (non-fatal)"
+    fi
 
     # Create the overlay mount directly over the original directory
     # Lower layer: original disk directory (read-only via overlay)
@@ -484,12 +582,27 @@ create_directory_overlay() {
     # Work layer: overlay filesystem internal use
     log "Mounting overlay on $target_dir..."
 
-    # Try with metacopy=off first (preferred — avoids unnecessary metadata copies)
-    # Fall back without it for kernels that don't support the flag
+    # Progressive fallback across mount-option support, oldest kernel last:
+    #   1) metacopy=off + volatile (5.10+)
+    #   2) metacopy=off only
+    #   3) neither
+    # volatile is a deliberate choice, not just a nice-to-have: upperdir is
+    # tmpfs, which is never durable across a reboot regardless, so
+    # overlayfs's own sync/fsync bookkeeping on that upperdir is protecting a
+    # durability guarantee this setup never makes in the first place.
+    # sync_changes() is what actually persists data (by rsyncing out to real
+    # disk) and is untouched by this option.
+    if mount -t overlay "overlay_${dir_name}" \
+        -o "lowerdir=${target_dir},upperdir=${upper_dir},workdir=${work_dir},metacopy=off,volatile,noatime" \
+        "$target_dir" 2>/dev/null; then
+        log "Successfully mounted RAM overlay on $target_dir (metacopy=off, volatile)"
+        return 0
+    fi
+
     if mount -t overlay "overlay_${dir_name}" \
         -o "lowerdir=${target_dir},upperdir=${upper_dir},workdir=${work_dir},metacopy=off,noatime" \
         "$target_dir" 2>/dev/null; then
-        log "Successfully mounted RAM overlay on $target_dir (metacopy=off)"
+        log "Successfully mounted RAM overlay on $target_dir (metacopy=off, volatile unsupported)"
         return 0
     fi
 
@@ -510,14 +623,19 @@ start_overlay() {
         log "RAM overlay is already active"
         return 0
     fi
-    
+
     log "Starting unified RAM overlay system..."
-    
+
     start_tmpfs_mounts
-    create_overlay_base
-    
+
+    if ! create_overlay_base; then
+        log "ERROR: Cannot create RAM overlay base - aborting overlay start (will retry on next login cycle)"
+        return 1
+    fi
+
     # Mount overlays on each specified directory
     local failed=0
+    local dir
     for dir in "${OVERLAY_DIRS[@]}"; do
         if [ -d "$dir" ]; then
             create_directory_overlay "$dir" || {
@@ -528,7 +646,7 @@ start_overlay() {
             log "WARNING: Directory $dir does not exist, skipping"
         fi
     done
-    
+
     if [ $failed -gt 0 ]; then
         log "WARNING: $failed overlay(s) failed to mount — system running in degraded mode"
         echo "degraded" > "$STATE_FILE"
@@ -540,21 +658,31 @@ start_overlay() {
 
     # Start incremental change tracking now that upper dirs exist
     start_inotify_watcher
-    
+
     log "RAM overlay system started successfully"
     log "Overlaid directories: ${OVERLAY_DIRS[*]}"
     log "Changes are being stored in RAM at: $OVERLAY_BASE"
-    
+
     df -h "$OVERLAY_BASE" 2>/dev/null | tail -1 | awk '{print "RAM allocated: " $2 " (Used: " $3 ", Available: " $4 ")"}'
-    
+
     log "tmpfs cleanup loop starting (interval=${CLEAN_INTERVAL}s, stale>${STALE_MINUTES}m)."
-    
+
     # Show what's actually overlaid
     log "Active overlay mounts:"
-    mount | grep "type overlay" | tee -a "$LOG_FILE"
+    findmnt -t overlay | tee -a "$LOG_FILE"
 }
 
+# Syncs RAM -> disk for every OVERLAY_DIRS entry, then remounts each overlay
+# so the system keeps serving normally afterward.
+#
+# $1 (optional): force incremental (1) or full (0) mode. If omitted,
+# auto-detects from whether the inotify watcher is currently alive. The
+# explicit form exists because stop_overlay needs to request incremental
+# mode AFTER it has already stopped the watcher (see notes there) --
+# auto-detection alone would always say "no" at that point.
 sync_changes() {
+    local use_inotify="${1:-}"
+
     if ! is_active; then
         log "RAM overlay is not active, nothing to sync"
         return 0
@@ -565,11 +693,31 @@ sync_changes() {
     local sync_dir_fail="/var/run/ramoverlay-syncfail"
     rm -f "${sync_dir_fail}".*
 
-    # Determine whether incremental (inotify) or full rsync mode
-    local use_inotify=0
-    [ -f "$INOTIFY_PIDFILE" ] && kill -0 "$(cat "$INOTIFY_PIDFILE")" 2>/dev/null && use_inotify=1
+    if [ -z "$use_inotify" ]; then
+        use_inotify=0
+        [ -f "$INOTIFY_PIDFILE" ] && kill -0 "$(cat "$INOTIFY_PIDFILE")" 2>/dev/null && use_inotify=1
+    fi
 
-    # --- per-directory sync, run in parallel (#5) ---
+    # Rotate the shared inotify queue exactly ONCE, before any per-directory
+    # parallel work starts, and have each directory's subshell below just
+    # read-filter the resulting static snapshot. The previous version had
+    # EACH per-directory subshell do this same mv-based rotation
+    # independently; with 2+ OVERLAY_DIRS (the actual default: /etc and
+    # /var/log) that's two concurrent renames racing on the same
+    # $INOTIFY_QUEUE/$INOTIFY_QUEUE.snap paths, and the loser's `mv` fails
+    # outright (source already moved by the winner) -- silently discarding
+    # that directory's pending changes for the pass instead of syncing them.
+    local snap="${INOTIFY_QUEUE}.snap"
+    if [ "$use_inotify" -eq 1 ]; then
+        if [ -s "$INOTIFY_QUEUE" ]; then
+            mv "$INOTIFY_QUEUE" "$snap"
+            : > "$INOTIFY_QUEUE"
+        else
+            log "No inotify-tracked changes since last sync, nothing to do"
+            return 0
+        fi
+    fi
+
     for dir in "${OVERLAY_DIRS[@]}"; do
         (
             local upper_dir="$OVERLAY_BASE/upper${dir}"
@@ -580,49 +728,55 @@ sync_changes() {
                 exit 0
             fi
 
-            # Build exclude list
             local exclude_opts=()
-            for excl in "${EXCLUDED_FROM_SYNC[@]}"; do
-                if [[ "$excl" == "$dir"* ]]; then
-                    exclude_opts+=("--exclude=${excl#$dir/}")
-                fi
-            done
+            while IFS= read -r opt; do
+                exclude_opts+=("$opt")
+            done < <(compute_exclude_opts "$dir")
 
-            # --- incremental path (#1) ---
             if [ "$use_inotify" -eq 1 ]; then
                 local changed_files
-                if changed_files=$(drain_inotify_queue "$upper_dir"); then
-                    local count
-                    count=$(echo "$changed_files" | wc -l)
-                    log "Incremental sync of $dir ($count changed file(s) via inotify)..."
+                changed_files=$(grep -F "${upper_dir}/" "$snap" 2>/dev/null \
+                    | sed "s|^${upper_dir}/||" \
+                    | sort -u)
 
-                    # Unmount so rsync writes to real disk, not back into overlay
-                    if ! umount_try "$dir"; then
-                        log "ERROR: Failed to unmount $dir for incremental sync"
-                        touch "$fail_flag"
-                        exit 1
-                    fi
-
-                    local rsync_ok=0
-                    { $RSYNC -aAXH "${exclude_opts[@]}" \
-                        --files-from=<(echo "$changed_files") \
-                        "$upper_dir/" "$dir/" 2>&1 || rsync_ok=$?; } | tee -a "$LOG_FILE"
-
-                    if [ "$rsync_ok" -ne 0 ]; then
-                        log "ERROR: Incremental rsync failed for $dir (exit $rsync_ok)"
-                        touch "$fail_flag"
-                    else
-                        log "Incremental sync of $dir complete"
-                    fi
-
-                    if ! create_directory_overlay "$dir"; then
-                        log "ERROR: Failed to remount overlay on $dir after incremental sync"
-                        touch "$fail_flag"
-                    fi
+                if [ -z "$changed_files" ]; then
+                    log "No inotify-tracked changes in $dir, skipping"
                     exit 0
                 fi
-                # Queue was empty for this dir — nothing to sync
-                log "No inotify-tracked changes in $dir, skipping"
+
+                local count
+                count=$(echo "$changed_files" | wc -l)
+                log "Incremental sync of $dir ($count changed file(s) via inotify)..."
+
+                # Unmount so rsync writes to real disk, not back into overlay
+                if ! umount_try "$dir"; then
+                    log "ERROR: Failed to unmount $dir for incremental sync"
+                    touch "$fail_flag"
+                    exit 1
+                fi
+
+                # Capture rsync's own exit code via PIPESTATUS rather than
+                # `cmd || var=$?` in front of a pipe -- the left side of a
+                # pipeline runs in its own subshell, so that assignment was
+                # being thrown away every time, and rsync failures during
+                # sync were never actually detected. (Static analysis flags
+                # this pattern as SC2030/SC2031; that's how it turned up.)
+                $RSYNC -aAXH "${exclude_opts[@]}" \
+                    --files-from=<(echo "$changed_files") \
+                    "$upper_dir/" "$dir/" 2>&1 | tee -a "$LOG_FILE"
+                local rsync_ok=${PIPESTATUS[0]}
+
+                if [ "$rsync_ok" -ne 0 ]; then
+                    log "ERROR: Incremental rsync failed for $dir (exit $rsync_ok)"
+                    touch "$fail_flag"
+                else
+                    log "Incremental sync of $dir complete"
+                fi
+
+                if ! create_directory_overlay "$dir" 0; then
+                    log "ERROR: Failed to remount overlay on $dir after incremental sync"
+                    touch "$fail_flag"
+                fi
                 exit 0
             fi
 
@@ -634,9 +788,9 @@ sync_changes() {
                 exit 1
             fi
 
-            local rsync_ok=0
-            { $RSYNC -aAXHv "${exclude_opts[@]}" \
-                "$upper_dir/" "$dir/" 2>&1 || rsync_ok=$?; } | tee -a "$LOG_FILE"
+            $RSYNC -aAXHv "${exclude_opts[@]}" \
+                "$upper_dir/" "$dir/" 2>&1 | tee -a "$LOG_FILE"
+            local rsync_ok=${PIPESTATUS[0]}
 
             if [ "$rsync_ok" -eq 0 ]; then
                 log "Successfully synced $dir"
@@ -645,15 +799,17 @@ sync_changes() {
                 touch "$fail_flag"
             fi
 
-            if ! create_directory_overlay "$dir"; then
+            if ! create_directory_overlay "$dir" 0; then
                 log "ERROR: Failed to remount overlay on $dir"
                 touch "$fail_flag"
             fi
         ) &
     done
 
-    # Wait for all parallel syncs to complete (#5)
+    # Wait for all parallel syncs to complete
     wait
+
+    [ -f "$snap" ] && rm -f "$snap"
 
     sync
 
@@ -682,57 +838,52 @@ stop_overlay() {
         stop_tmpfs_mounts
         return 0
     fi
-    
+
     log "Stopping RAM overlay system..."
 
-    # Stop the watcher before final sync so the queue captures all remaining events
-    # then is drained once, with no new events arriving mid-sync
+    # Snapshot whether the watcher was actually alive BEFORE stopping it, and
+    # pass that into sync_changes explicitly. Previously stop_inotify_watcher
+    # ran first and removed $INOTIFY_PIDFILE, so sync_changes's own "is the
+    # watcher alive" check was always false by the time it ran here -- every
+    # real sync silently fell back to a full-tree rsync of the entire
+    # directory, and the inotify/queue machinery never actually engaged
+    # despite being fully implemented.
+    local had_watcher=0
+    [ -f "$INOTIFY_PIDFILE" ] && kill -0 "$(cat "$INOTIFY_PIDFILE")" 2>/dev/null && had_watcher=1
+
+    # Stop the watcher before syncing so the queue captures all remaining
+    # events and nothing new arrives mid-sync.
     stop_inotify_watcher
 
-    # Sync changes first (this will unmount and remount overlays)
-    sync_changes
-    
+    # sync_changes() is now the single place that copies RAM -> disk. The
+    # old code did this here too, unconditionally and in full, immediately
+    # after sync_changes had already done it (whether full or, once fixed,
+    # incremental) -- every logout paid for two complete rsyncs of /etc and
+    # /var/log back to back, and the second one didn't even honor
+    # EXCLUDED_FROM_SYNC. sync_changes remounts each directory afterward;
+    # the unmount loop below immediately undoes that, which is a
+    # deliberately cheap no-op (one mount/unmount syscall pair) traded for
+    # keeping sync_changes's "sync and keep serving" shape usable as-is for
+    # the periodic mid-session sync in the main loop.
+    sync_changes "$had_watcher"
+
     # Unmount overlays in reverse order
     log "Unmounting overlay filesystems..."
     for ((i=${#OVERLAY_DIRS[@]}-1; i>=0; i--)); do
         local dir="${OVERLAY_DIRS[i]}"
-        if mount | grep -q " on $dir type overlay"; then
-            log "Unmounting overlay on $dir..."
-            
-            local upper_dir="$OVERLAY_BASE/upper${dir}"
-            
-            # Check if there are any unsynced changes
-            if [ -d "$upper_dir" ] && [ -n "$(ls -A "$upper_dir" 2>/dev/null)" ]; then
-                log "Final sync of $dir before unmount..."
-                
-                # Unmount the overlay first to access real disk directory
-                if umount_try "$dir"; then
-                    # Sync changes directly from upper layer to real directory
-                    log "Syncing changes from overlay to disk for $dir..."
-                    local sync_rc=0
-                    { $RSYNC -aAXH "$upper_dir/" "$dir/" 2>&1 || sync_rc=$?; } | tee -a "$LOG_FILE"
-                    if [ "$sync_rc" -ne 0 ]; then
-                        log "ERROR: Failed final sync of $dir"
-                    fi
-                else
-                    log "ERROR: Failed to unmount $dir"
-                fi
-            else
-                umount_try "$dir" || true
-            fi
-        fi
+        umount_try "$dir" || log "ERROR: Failed to unmount $dir"
     done
-    
+
     # Unmount the overlay base
     if mountpoint -q "$OVERLAY_BASE"; then
         log "Unmounting tmpfs and freeing RAM..."
         umount "$OVERLAY_BASE" || log "Warning: Failed to unmount tmpfs"
     fi
-    
+
     rm -f "$STATE_FILE"
-    
+
     stop_tmpfs_mounts
-    
+
     log "RAM overlay system stopped - RAM freed"
 
     # Truncate log so next boot starts fresh — archive last session first
@@ -745,35 +896,45 @@ stop_overlay() {
 get_logged_in_users() {
     # More reliable user detection
     local count=0
-    
+
     # Check who command
     count=$(who | awk '{print $1}' | sort -u | wc -l)
-    
+
     # If no users from who, check for X sessions (count only sockets)
-    if [ $count -eq 0 ] && [ -d /tmp/.X11-unix ]; then
+    if [ "$count" -eq 0 ] && [ -d /tmp/.X11-unix ]; then
         count=$(find /tmp/.X11-unix -maxdepth 1 -name 'X*' -type s 2>/dev/null | wc -l)
     fi
-    
-    echo $count
+
+    echo "$count"
 }
 
 wait_for_login() {
     log "Waiting for user login..."
-    
+
     while true; do
         local users
         users=$(get_logged_in_users)
-        
+
         if [ "$users" -gt 0 ]; then
             log "User login detected ($users users)"
             return 0
         fi
-        
+
         sleep 5
     done
 }
 
+CLEANUP_DONE=0
+
 shutdown_cleanup() {
+    # Guard against running twice: this fires once for whatever signal
+    # triggered it, and then again as part of ITS OWN `exit` below (since
+    # EXIT is also trapped, so any exit path -- including one caused by an
+    # unguarded command failing under `set -e` elsewhere -- still triggers a
+    # sync instead of silently dropping whatever's only in the RAM overlay).
+    [ "$CLEANUP_DONE" -eq 1 ] && exit 0
+    CLEANUP_DONE=1
+
     log "Shutdown/reboot signal received - syncing all changes to disk..."
     stop_overlay
     rm -f "$DAEMON_PIDFILE"
@@ -795,15 +956,21 @@ touch "$LOG_FILE" || true
 
 log "Unified RAM overlay daemon started (PID: $$)"
 log "Overlay directories: ${OVERLAY_DIRS[*]}"
-[ "$USE_LSOF" -eq 1 ] && log "Using lsof to detect open files" || log "Using fuser or /proc fallback for file detection"
+if [ "$USE_LSOF" -eq 1 ]; then
+    log "Using lsof to detect open files (batched once per cleanup pass)"
+elif [ "$USE_FUSER" -eq 1 ]; then
+    log "Using fuser to detect open files (per-file check; install lsof for a faster batched check)"
+else
+    log "Using /proc fallback to detect open files (batched once per cleanup pass)"
+fi
 
-trap shutdown_cleanup SIGTERM SIGINT SIGHUP
+trap shutdown_cleanup EXIT SIGTERM SIGINT SIGHUP
 
 while true; do
     wait_for_login
-    
+
     sleep 3
-    
+
     log "Starting RAM overlay system..."
     if start_overlay; then
         if is_degraded; then
@@ -812,31 +979,43 @@ while true; do
         else
             log "RAM overlay started successfully"
             log "System is now running with RAM-backed directories"
-            log "Check 'mount | grep overlay' to see active overlays"
+            log "Check 'findmnt -t overlay' to see active overlays"
         fi
     else
         log "ERROR: Failed to start RAM overlay - will retry on next login"
         sleep 5
         continue
     fi
-    
-    while [ $(get_logged_in_users) -gt 0 ]; do
+
+    elapsed_since_sync=0
+    while [ "$(get_logged_in_users)" -gt 0 ]; do
         sleep "$CLEAN_INTERVAL"
         cleanup_stale_files
+
+        if [ "$SYNC_INTERVAL" -gt 0 ]; then
+            elapsed_since_sync=$((elapsed_since_sync + CLEAN_INTERVAL))
+            if [ "$elapsed_since_sync" -ge "$SYNC_INTERVAL" ]; then
+                elapsed_since_sync=0
+                watcher_alive=0
+                [ -f "$INOTIFY_PIDFILE" ] && kill -0 "$(cat "$INOTIFY_PIDFILE")" 2>/dev/null && watcher_alive=1
+                log "Periodic sync (interval=${SYNC_INTERVAL}s)..."
+                sync_changes "$watcher_alive" || log "WARNING: periodic sync reported failures"
+            fi
+        fi
     done
-    
+
     log "All users logged out - initiating shutdown sequence"
-    
+
     sleep 2
-    
+
     log "Stopping and syncing RAM overlay..."
     if stop_overlay; then
         log "RAM overlay stopped and synced successfully"
     else
         log "ERROR: Issues during RAM overlay shutdown"
     fi
-    
+
     log "System ready for next login cycle"
-    
+
     sleep 5
 done
