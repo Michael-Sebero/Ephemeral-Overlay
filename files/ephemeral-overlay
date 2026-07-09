@@ -463,7 +463,19 @@ stop_inotify_watcher() {
         pid=$(cat "$INOTIFY_PIDFILE")
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
-        rm -f "$INOTIFY_PIDFILE" "$INOTIFY_QUEUE"
+        rm -f "$INOTIFY_PIDFILE"
+        # Deliberately NOT removing $INOTIFY_QUEUE here: stop_overlay calls
+        # this BEFORE sync_changes, specifically so sync_changes can still
+        # be told "the watcher was alive, use incremental mode" via its
+        # explicit parameter. If this deleted the queue too, sync_changes
+        # would find it missing and conclude there was nothing to sync --
+        # silently skipping the sync entirely rather than falling back to
+        # full, even when the queue genuinely had pending changes in it.
+        # Caught by testing a real write through a full stop_overlay cycle,
+        # not by inspection -- the log said "No inotify-tracked changes
+        # since last sync" right after a write that very much hadn't been
+        # synced yet. sync_changes recreates the queue empty after it
+        # successfully drains it, so nothing accumulates unbounded here.
         log "inotify watcher stopped"
     fi
 }
@@ -583,26 +595,30 @@ create_directory_overlay() {
     log "Mounting overlay on $target_dir..."
 
     # Progressive fallback across mount-option support, oldest kernel last:
-    #   1) metacopy=off + volatile (5.10+)
-    #   2) metacopy=off only
-    #   3) neither
-    # volatile is a deliberate choice, not just a nice-to-have: upperdir is
-    # tmpfs, which is never durable across a reboot regardless, so
-    # overlayfs's own sync/fsync bookkeeping on that upperdir is protecting a
-    # durability guarantee this setup never makes in the first place.
-    # sync_changes() is what actually persists data (by rsyncing out to real
-    # disk) and is untouched by this option.
-    if mount -t overlay "overlay_${dir_name}" \
-        -o "lowerdir=${target_dir},upperdir=${upper_dir},workdir=${work_dir},metacopy=off,volatile,noatime" \
-        "$target_dir" 2>/dev/null; then
-        log "Successfully mounted RAM overlay on $target_dir (metacopy=off, volatile)"
-        return 0
-    fi
-
+    #   1) metacopy=off
+    #   2) neither
+    #
+    # NOTE on `volatile`: an earlier version of this used the overlay
+    # `volatile` mount option here, reasoning that upperdir is tmpfs (never
+    # durable across a reboot anyway) so overlayfs's own sync/fsync
+    # bookkeeping on it is protecting a guarantee this setup never makes.
+    # That reasoning about durability is correct, but volatile turned out to
+    # be actively incompatible with this daemon's design: mounting with
+    # volatile writes a `work/incompat/volatile` marker into workdir, and
+    # the kernel then refuses to mount that workdir AGAIN for the rest of
+    # the session -- with or without volatile -- until it's wiped. Since
+    # sync_changes() unmounts and remounts every overlay dir on every sync
+    # (incremental or full), and OVERLAY_BASE's workdir isn't recreated
+    # until the whole tmpfs is torn down at logout, the very first sync
+    # after using volatile would have permanently broken every subsequent
+    # remount for that directory for the rest of the session -- writes
+    # would silently fall through to disk from then on, defeating the
+    # entire point. Confirmed with a real mount/write/sync/remount cycle,
+    # not just by reading the kernel docs. Not used here as a result.
     if mount -t overlay "overlay_${dir_name}" \
         -o "lowerdir=${target_dir},upperdir=${upper_dir},workdir=${work_dir},metacopy=off,noatime" \
         "$target_dir" 2>/dev/null; then
-        log "Successfully mounted RAM overlay on $target_dir (metacopy=off, volatile unsupported)"
+        log "Successfully mounted RAM overlay on $target_dir (metacopy=off)"
         return 0
     fi
 
@@ -908,6 +924,22 @@ get_logged_in_users() {
     echo "$count"
 }
 
+# Plain `sleep N` defers any trapped signal until the sleep finishes --
+# bash only checks for pending traps between commands, not during one.
+# Confirmed directly: a bare `sleep 30` delayed a SIGTERM trap by ~28s in
+# testing. Sleeping in 1-second increments instead means a signal gets
+# noticed within ~1s, which matters here because whatever supervises this
+# daemon (s6, systemd, runit, ...) may escalate to SIGKILL well before 30s,
+# skipping shutdown_cleanup's sync entirely if it's still queued behind a
+# long sleep when the signal arrives.
+responsive_sleep() {
+    local remaining="$1"
+    while [ "$remaining" -gt 0 ]; do
+        sleep 1
+        remaining=$((remaining - 1))
+    done
+}
+
 wait_for_login() {
     log "Waiting for user login..."
 
@@ -920,7 +952,7 @@ wait_for_login() {
             return 0
         fi
 
-        sleep 5
+        responsive_sleep 5
     done
 }
 
@@ -969,7 +1001,7 @@ trap shutdown_cleanup EXIT SIGTERM SIGINT SIGHUP
 while true; do
     wait_for_login
 
-    sleep 3
+    responsive_sleep 3
 
     log "Starting RAM overlay system..."
     if start_overlay; then
@@ -983,13 +1015,13 @@ while true; do
         fi
     else
         log "ERROR: Failed to start RAM overlay - will retry on next login"
-        sleep 5
+        responsive_sleep 5
         continue
     fi
 
     elapsed_since_sync=0
     while [ "$(get_logged_in_users)" -gt 0 ]; do
-        sleep "$CLEAN_INTERVAL"
+        responsive_sleep "$CLEAN_INTERVAL"
         cleanup_stale_files
 
         if [ "$SYNC_INTERVAL" -gt 0 ]; then
@@ -1006,7 +1038,7 @@ while true; do
 
     log "All users logged out - initiating shutdown sequence"
 
-    sleep 2
+    responsive_sleep 2
 
     log "Stopping and syncing RAM overlay..."
     if stop_overlay; then
@@ -1017,5 +1049,5 @@ while true; do
 
     log "System ready for next login cycle"
 
-    sleep 5
+    responsive_sleep 5
 done
