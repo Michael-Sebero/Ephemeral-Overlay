@@ -53,7 +53,7 @@ Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync`, `find`, 
 * **RAM:** 16GB+ recommended (typical usage: 200MB-2GB)
 * **Filesystem:** Supports OverlayFS (ext4, btrfs, xfs, f2fs)
 * **Optional:** `libmimalloc.so` for faster syncs
-* **Optional:** Kernel 5.10+ for the overlay `volatile` mount option, 6.3+ for tmpfs `noswap` — both are tried first and fall back cleanly on older kernels, so neither is a hard requirement
+* **Optional:** Kernel 6.3+ for the tmpfs `noswap` mount option — tried first and falls back cleanly on older kernels, so it's not a hard requirement
 
 ---
 
@@ -62,7 +62,6 @@ Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync`, `find`, 
 ```bash
 sudo cp ephemeral-overlay /bin/
 sudo chmod 755 /bin/ephemeral-overlay
-sudo /bin/ephemeral-overlay
 ```
 
 **On rc.local systems**, add to `/etc/rc.local`:
@@ -163,16 +162,16 @@ tail -f /var/log/ramoverlay.log
 | Sequential Write | 530 MB/s | 2,128 MB/s | **4x faster** |
 | RAM Overhead | 0 | ~200MB | Minimal |
 
-*Benchmarked on Samsung 870 EVO SATA SSD.* These numbers predate the `volatile`/`noswap` mount tuning above; the RAM-vs-SSD comparison itself is unaffected, but if you want current figures they're worth re-running since `volatile` removes some overlayfs-side sync overhead.
+*Benchmarked on Samsung 870 EVO SATA SSD.* The RAM-vs-SSD comparison itself is a hardware characteristic, unaffected by anything above.
 
 ---
 
 ## Safety Features
 
 * **Best-effort persistence:** Changes sync to disk periodically during the session, and on logout/shutdown; sync errors are detected and logged, but there is no retry logic or post-sync verification pass
-* **Signal handling:** Gracefully handles SIGTERM, SIGINT, and SIGHUP, and also traps `EXIT` directly so an unexpected termination (not just a clean signal) still triggers a sync attempt before the process actually dies
+* **Signal handling:** Gracefully handles SIGTERM, SIGINT, and SIGHUP, and also traps `EXIT` directly so an unexpected termination (not just a clean signal) still triggers a sync attempt before the process actually dies. Sleeps in the main loop are broken into 1-second increments rather than one long `sleep N` — bash only checks for a pending trap between commands, so a signal arriving mid-sleep would otherwise sit queued for up to `CLEAN_INTERVAL` (30s by default) before shutdown actually started, which is long enough that a process supervisor with a shorter kill-escalation timeout could SIGKILL it first and skip the sync entirely
 * **File-in-use detection:** Never deletes files that are currently open
 * **Rsync verification:** Checks rsync exit codes (captured independently of `tee`) and logs sync failures
 * **Protected directories:** User data in `/home` is never overlaid
-* **OverlayFS semantics:** Per-file writes are atomic via OverlayFS; however, the sync process (unmount → rsync → remount) is not crash-safe - a power loss mid-sync may leave the filesystem partially written. The overlay mount uses `volatile` where supported, which skips overlayfs's own sync/fsync bookkeeping on the upper layer — that bookkeeping protects a durability guarantee this setup never made anyway, since upper is tmpfs and never survives a reboot regardless
+* **OverlayFS semantics:** Per-file writes are atomic via OverlayFS; however, the sync process (unmount → rsync → remount) is not crash-safe - a power loss mid-sync may leave the filesystem partially written. The overlay mount deliberately does *not* use the `volatile` option — it looked like a good fit (upper is tmpfs, never durable across a reboot anyway, so overlayfs's own sync/fsync bookkeeping on it seemed redundant) but testing showed it writes a marker into workdir that makes the kernel refuse every subsequent mount using that workdir, with or without `volatile`, until it's wiped — which breaks the remount this daemon does on every single sync
 * **Fallback mechanisms:** Multiple methods for file-in-use detection

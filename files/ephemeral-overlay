@@ -44,7 +44,7 @@ SYNC_INTERVAL=300
 PERSIST_ROOT="/persist"
 
 BIND_MOUNTED_VAR_CACHE=(pacman)
-BIND_MOUNTED_USER_CACHE=(nvidia mesa_shader_cache mesa_shader_cache_db)
+BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db)
 
 # Directories to overlay (will be mounted in RAM and actually used)
 # NOTE: Exclude large package/runtime directories to save RAM
@@ -582,6 +582,22 @@ create_directory_overlay() {
         while IFS= read -r opt; do
             exclude_opts+=("$opt")
         done < <(compute_exclude_opts "$target_dir")
+
+        # Force upper_dir's OWN top-level mode/owner/group to match
+        # target_dir exactly, before anything is copied in. mkdir -p above
+        # created upper_dir under the process umask, not target_dir's real
+        # mode -- and --ignore-existing below will NOT correct a directory
+        # that already exists at the destination, only copy in entries that
+        # don't exist yet. Left unfixed, upper_dir's top-level permissions
+        # silently diverge from target_dir's, and sync_changes' full-rsync
+        # fallback (used whenever inotifywait isn't tracking, e.g.
+        # inotify-tools isn't installed) later mirrors that divergent
+        # top-level mode/owner straight onto the REAL on-disk target_dir --
+        # rsync -a syncs the destination root's own attributes to match the
+        # source root even with trailing slashes on both sides, it's not
+        # limited to the children.
+        chmod --reference="$target_dir" "$upper_dir"
+        chown --reference="$target_dir" "$upper_dir"
 
         log "Pre-populating upper layer for $target_dir (ensures full stat visibility)..."
         $RSYNC -aAX --ignore-existing "${exclude_opts[@]}" "$target_dir/" "$upper_dir/" 2>/dev/null || \
