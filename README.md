@@ -1,4 +1,5 @@
-Speeds up temporary and root directories by moving them into RAM, reducing disk I/O. Changes sync back to disk automatically, so nothing is lost on logout.
+## Summary
+Ephemeral Overlay speeds up specified directories by moving them into RAM, reducing disk I/O and increasing system responsiveness.
 
 ## Features
 
