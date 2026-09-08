@@ -13,7 +13,7 @@ Ephemeral Overlay speeds up specified directories by moving them into RAM, reduc
 * **Automatic:** Activates on login, syncs periodically during the session and on logout. Default sync interval is 5 minutes. `/etc` gets synced more often, more on that below
 * Extend it through the `OVERLAY_DIRS` array
 
-### Tmpfs Mounts for Temporary Data
+### TMPFS Mounts for Temporary Data
 
 RAM storage for temporary files, cleaned automatically on logout:
 * `/tmp` (5 GB) and `/var/tmp` (1 GB)
