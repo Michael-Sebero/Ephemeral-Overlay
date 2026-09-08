@@ -34,7 +34,7 @@ Essential caches bind-mounted to `/persist` to survive reboots:
 * `/proc`, `/sys`, `/dev`, `/run` - Virtual filesystems
 * `/mnt`, `/media`, `/boot` - Mount points
 
-Within an overlaid directory, `/var/log/journal` is excluded from both sync and the RAM pre-population step (`EXCLUDED_FROM_SYNC`). It's high-churn, journald manages its own persistence, and there's no reason to copy it into RAM if it never gets written back to disk anyway.
+Within an overlaid directory, `/var/log/journal` is excluded from both sync and the RAM pre-population step (`EXCLUDED_FROM_SYNC`). It's high-churn, journald manages its own persistence and there's no reason to copy it into RAM if it never gets written back to disk anyway.
 
 `EXCLUDED_FROM_SYNC` also lists `/var/lib/systemd`, left over from when `/var/lib` used to be part of the overlay too. Since `/var/lib` isn't in `OVERLAY_DIRS` by default, that entry doesn't currently match anything. It only matters if you add `/var/lib` back yourself.
 
@@ -43,13 +43,13 @@ Within an overlaid directory, `/var/log/journal` is excluded from both sync and 
 * **Periodic cleanup:** Removes stale files older than 5 minutes, checked every 30 seconds
 * **Periodic sync:** Syncs RAM changes back to disk every 5 minutes while a session is active (`SYNC_INTERVAL`, set to `0` to disable), plus a final sync at logout. This bounds how much a crash or power loss mid-session can cost you. `/etc` gets tighter coverage on top of that: a dedicated watcher (`EAGER_SYNC_DIRS`) checks every `CLEAN_INTERVAL` (30 seconds by default) and syncs pending `/etc` changes right away. The 5-minute interval is just the fallback cadence for `/var/log` and anything else added to the overlay
 * **File protection:** Skips files currently in use, checked via `lsof`, `fuser`, or `/proc`
-* **Graceful shutdown:** Catches SIGTERM, SIGINT, and SIGHUP, plus unexpected exits, and syncs before exiting
-* **Logging:** All operations are tracked in `/var/log/ramoverlay.log` for the current session. The previous session's log gets archived to `/var/log/ramoverlay.last.log`, and the main log is truncated at the end of each session, so only the current and immediately prior session stick around
+* **Graceful shutdown:** Catches SIGTERM, SIGINT and SIGHUP, plus unexpected exits and syncs before exiting
+* **Logging:** All operations are tracked in `/var/log/ramoverlay.log` for the current session. The previous session's log gets archived to `/var/log/ramoverlay.last.log` and the main log is truncated at the end of each session, so only the current and immediately prior session stick around
 * **Memory-pressure warning:** Logs a warning if available RAM drops below 10% (`MEM_WARN_PERCENT`). Sustained pressure risks the OOM killer targeting Xorg or the compositor
 
 ### Optional Performance Boost
 
-Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync`, `find`, and `inotifywait` when available, cutting down on memory fragmentation during sync operations and long-lived event watching.
+Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync`, `find` and `inotifywait` when available, cutting down on memory fragmentation during sync operations and long-lived event watching.
 
 ## Requirements
 
@@ -164,7 +164,7 @@ tail -f /var/log/ramoverlay.log
 3. **Operate:** All writes to overlaid directories go to RAM (9.3x faster)
 4. **Cleanup:** Daemon removes stale temp files every 30 seconds
 5. **Sync:** Incrementally syncs changed files back to disk every 5 minutes while the session is active, with `/etc` synced eagerly within about 30 seconds of a change, then a final full sync on logout
-6. **Sleep:** Once no users have been detected for 3 consecutive checks 10 seconds apart, unmounts everything, frees RAM, and waits for the next login
+6. **Sleep:** Once no users have been detected for 3 consecutive checks 10 seconds apart, unmounts everything, frees RAM and waits for the next login
 
 ## Performance (vs SATA SSD)
 
@@ -181,12 +181,12 @@ tail -f /var/log/ramoverlay.log
 
 * **Best-effort persistence:** Changes sync to disk periodically during the session and again on logout or shutdown. Sync errors are detected and logged, but there's no retry logic or verification pass afterward
 * **File-in-use detection:** Never deletes files that are currently open
-* **Rsync verification:** Checks rsync exit codes, captured independently of `tee`, and logs any sync failures
+* **Rsync verification:** Checks rsync exit codes, captured independently of `tee` and logs any sync failures
 * **Protected directories:** `/home` is never overlaid by default. It's just not in `OVERLAY_DIRS`. There's no code-level check blocking it either, so treat this as a strong default, not a hard guarantee. Don't add `/home` to `OVERLAY_DIRS` yourself
 * **Fallback mechanisms:** Multiple methods for file-in-use detection
 
-**Signal handling:** The daemon gracefully handles SIGTERM, SIGINT, and SIGHUP, and also traps `EXIT` directly, so even an unexpected termination triggers a sync attempt before the process dies, not just a clean signal. The main loop sleeps in 1-second increments instead of one long `sleep N` call. Bash only checks for a pending trap between commands, so a signal arriving mid-sleep would otherwise queue for up to `CLEAN_INTERVAL` (30 seconds by default) before shutdown even started. That's long enough for a process supervisor with a shorter kill-escalation timeout to SIGKILL the daemon first and skip the sync entirely.
+**Signal handling:** The daemon gracefully handles SIGTERM, SIGINT and SIGHUP and also traps `EXIT` directly, so even an unexpected termination triggers a sync attempt before the process dies, not just a clean signal. The main loop sleeps in 1-second increments instead of one long `sleep N` call. Bash only checks for a pending trap between commands, so a signal arriving mid-sleep would otherwise queue for up to `CLEAN_INTERVAL` (30 seconds by default) before shutdown even started. That's long enough for a process supervisor with a shorter kill-escalation timeout to SIGKILL the daemon first and skip the sync entirely.
 
-**OverlayFS semantics:** Per-file writes are atomic through OverlayFS, but the sync itself isn't crash-safe. A power loss mid-rsync can leave the filesystem partially written. That's not a mount-level risk though. The overlay is mounted once at login and unmounted once at logout, and every sync in between (periodic, eager, or final) is just an rsync from the RAM upper layer onto the on-disk copy, no unmount or remount involved.
+**OverlayFS semantics:** Per-file writes are atomic through OverlayFS, but the sync itself isn't crash-safe. A power loss mid-rsync can leave the filesystem partially written. That's not a mount-level risk though. The overlay is mounted once at login and unmounted once at logout and every sync in between (periodic, eager, or final) is just an rsync from the RAM upper layer onto the on-disk copy, no unmount or remount involved.
 
 The mount also deliberately skips the `volatile` option. It looked like a good fit at first. The upper layer is tmpfs and never durable across a reboot anyway, so OverlayFS's own sync/fsync bookkeeping on it seemed pointless. Testing showed otherwise: it writes a marker into workdir that makes the kernel refuse every later mount using that workdir, with or without `volatile`, until it's wiped. The RAM tmpfs and its workdir get destroyed on a clean logout and rebuilt from scratch at the next login. This only becomes a problem if the daemon is killed uncleanly and a restart inherits the still-mounted tmpfs.
