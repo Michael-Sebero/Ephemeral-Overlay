@@ -47,7 +47,7 @@ Within an overlaid directory, `/var/log/journal` is excluded from both sync and 
 * **Logging:** All operations are tracked in `/var/log/ramoverlay.log` for the current session. The previous session's log gets archived to `/var/log/ramoverlay.last.log` and the main log is truncated at the end of each session, so only the current and immediately prior session stick around
 * **Memory-pressure warning:** Logs a warning if available RAM drops below 10% (`MEM_WARN_PERCENT`). Sustained pressure risks the OOM killer targeting Xorg or the compositor
 
-### Optional Performance Boost
+### Mimalloc Integration
 
 Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync`, `find` and `inotifywait` when available, cutting down on memory fragmentation during sync operations and long-lived event watching.
 
