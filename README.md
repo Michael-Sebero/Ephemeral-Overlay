@@ -102,7 +102,7 @@ BIND_MOUNTED_VAR_CACHE=(pacman)
 BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db)
 ```
 
-**Tmpfs sizes:**
+**TMPFS sizes:**
 ```bash
 OVERLAY_BASE_SIZE="50%"  # Ceiling for the RAM overlay itself, as % of total RAM
 TMP_SIZE="5G"
@@ -153,7 +153,7 @@ tail -f /var/log/ramoverlay.log
 **Typical RAM usage:**
 * Light: 200-500 MB (~1-2% of 16GB)
 * Heavy: 1-2 GB (~5-10% of 16GB)
-* Allocated: 50% of total RAM by default (`OVERLAY_BASE_SIZE`). That's a ceiling, not a reservation. Tmpfs only uses what's actually written
+* Allocated: 50% of total RAM by default (`OVERLAY_BASE_SIZE`). That's a ceiling, not a reservation. TMPFS only uses what's actually written
 
 ---
 
