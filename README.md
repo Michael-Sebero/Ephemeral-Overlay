@@ -57,7 +57,7 @@ Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync`, `find` a
 * **RAM:** 16GB+ recommended (typical usage: 200MB-2GB)
 * **Filesystem:** Supports OverlayFS (ext4, btrfs, xfs, f2fs)
 * **Optional:** `libmimalloc.so` for faster syncs
-* **Optional:** Kernel 6.3+ for the tmpfs `noswap` mount option. Tried first, falls back cleanly on older kernels, so it's not required
+* **Optional:** Kernel 6.3+ for the TMPFS `noswap` mount option. Tried first, falls back cleanly on older kernels, so it's not required
 
 ## Installation
 
@@ -160,7 +160,7 @@ tail -f /var/log/ramoverlay.log
 ## How It Works
 
 1. **Wait:** Daemon waits for user login
-2. **Activate:** On login, creates RAM overlay and tmpfs mounts
+2. **Activate:** On login, creates RAM overlay and TMPFS mounts
 3. **Operate:** All writes to overlaid directories go to RAM (9.3x faster)
 4. **Cleanup:** Daemon removes stale temp files every 30 seconds
 5. **Sync:** Incrementally syncs changed files back to disk every 5 minutes while the session is active, with `/etc` synced eagerly within about 30 seconds of a change, then a final full sync on logout
@@ -189,4 +189,4 @@ tail -f /var/log/ramoverlay.log
 
 **OverlayFS semantics:** Per-file writes are atomic through OverlayFS, but the sync itself isn't crash-safe. A power loss mid-rsync can leave the filesystem partially written. That's not a mount-level risk though. The overlay is mounted once at login and unmounted once at logout and every sync in between (periodic, eager, or final) is just an rsync from the RAM upper layer onto the on-disk copy, no unmount or remount involved.
 
-The mount also deliberately skips the `volatile` option. It looked like a good fit at first. The upper layer is tmpfs and never durable across a reboot anyway, so OverlayFS's own sync/fsync bookkeeping on it seemed pointless. Testing showed otherwise: it writes a marker into workdir that makes the kernel refuse every later mount using that workdir, with or without `volatile`, until it's wiped. The RAM tmpfs and its workdir get destroyed on a clean logout and rebuilt from scratch at the next login. This only becomes a problem if the daemon is killed uncleanly and a restart inherits the still-mounted tmpfs.
+The mount also deliberately skips the `volatile` option. It looked like a good fit at first. The upper layer is TMPFS and never durable across a reboot anyway, so OverlayFS's own sync/fsync bookkeeping on it seemed pointless. Testing showed otherwise: it writes a marker into workdir that makes the kernel refuse every later mount using that workdir, with or without `volatile`, until it's wiped. The RAM TMPFS and its workdir get destroyed on a clean logout and rebuilt from scratch at the next login. This only becomes a problem if the daemon is killed uncleanly and a restart inherits the still-mounted TMPFS.
