@@ -41,7 +41,7 @@ SYNC_INTERVAL=300
 PERSIST_ROOT="/persist"
 
 BIND_MOUNTED_VAR_CACHE=(pacman)
-BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db)
+BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db TauonMusicBox)
 
 OVERLAY_DIRS=(
     "/etc"
@@ -777,48 +777,25 @@ stop_overlay() {
 }
 
 get_logged_in_users() {
-    local count=0 c u uid id class s w
+    local count=0 c
 
-    # Only real users (uid >= 1000) count as a login. Display-manager greeters (lightdm, sddm)
-    # run as system users and must not trigger the overlay before anyone has logged in.
-    c=0
-    while read -r u; do
-        [ -n "$u" ] || continue
-        uid=$(id -u "$u" 2>/dev/null) && [ "$uid" -ge 1000 ] && c=$((c + 1))
-    done < <(who 2>/dev/null | awk '{print $1}' | sort -u)
+    c=$(who 2>/dev/null | awk '{print $1}' | sort -u | wc -l)
     [ "$c" -gt "$count" ] && count=$c
 
-    # logind/elogind sessions: greeters run as system users (uid < 1000) and/or report Class=greeter
     if command -v loginctl >/dev/null 2>&1; then
-        c=0
-        while read -r id uid _; do
-            [ -n "$id" ] && [ "${uid:-0}" -ge 1000 ] || continue
-            class=$(loginctl show-session "$id" -p Class 2>/dev/null)
-            [ "$class" = "Class=greeter" ] && continue
-            c=$((c + 1))
-        done < <(loginctl list-sessions --no-legend 2>/dev/null)
+        c=$(loginctl list-sessions --no-legend 2>/dev/null | wc -l)
         [ "$c" -gt "$count" ] && count=$c
     fi
 
-    # X sockets: the display manager's X server is root-owned; only count user-owned ones (startx etc.)
     if [ -d /tmp/.X11-unix ]; then
-        c=0
-        for s in /tmp/.X11-unix/X*; do
-            [ -S "$s" ] || continue
-            [ "$(stat -c %u "$s" 2>/dev/null || echo 0)" -ge 1000 ] && c=$((c + 1))
-        done
+        c=$(find /tmp/.X11-unix -maxdepth 1 -name 'X*' -type s 2>/dev/null | wc -l)
         [ "$c" -gt "$count" ] && count=$c
     fi
 
-    # Wayland sockets: only in a real user's runtime dir (the sddm greeter lives in a system user's)
-    c=0
     shopt -s nullglob
-    for w in /run/user/[0-9]*/wayland-[0-9]*; do
-        uid=${w#/run/user/}; uid=${uid%%/*}
-        [ "$uid" -ge 1000 ] && c=$((c + 1))
-    done
+    local wl=(/run/user/[0-9]*/wayland-[0-9]*)
     shopt -u nullglob
-    [ "$c" -gt "$count" ] && count=$c
+    [ "${#wl[@]}" -gt "$count" ] && count=${#wl[@]}
 
     echo "$count"
 }
