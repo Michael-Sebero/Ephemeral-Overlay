@@ -831,33 +831,10 @@ responsive_sleep() {
     done
 }
 
-display_server_present() {
-    local s
-    if [ -d /tmp/.X11-unix ]; then
-        for s in /tmp/.X11-unix/X*; do
-            [ -S "$s" ] && return 0
-        done
-    fi
-
-    shopt -s nullglob
-    local w
-    for w in /run/user/*/wayland-[0-9]*; do
-        [ -S "$w" ] && { shopt -u nullglob; return 0; }
-    done
-    shopt -u nullglob
-
-    return 1
-}
-
 wait_for_login() {
-    log "Waiting for a display server or user login..."
+    log "Waiting for user login..."
 
     while true; do
-        if display_server_present; then
-            log "Display server detected - starting overlay ahead of session start"
-            return 0
-        fi
-
         local users
         users=$(get_logged_in_users)
 
@@ -956,25 +933,6 @@ cli_log() {
     fi
 }
 
-cli_wait_ready() {
-    local timeout="${1:-5}"
-    case "$timeout" in
-        ''|*[!0-9]*) timeout=5 ;;
-    esac
-    local tenths=$((timeout * 10))
-    local i=0
-    while [ "$i" -lt "$tenths" ]; do
-        if is_active; then
-            log "wait-ready: overlay ready after $((i * 100))ms"
-            exit 0
-        fi
-        sleep 0.1
-        i=$((i + 1))
-    done
-    log "wait-ready: timed out after ${timeout}s waiting for overlay - continuing anyway (fail-open)"
-    exit 0
-}
-
 case "${1:-}" in
     status)
         cli_status
@@ -988,13 +946,10 @@ case "${1:-}" in
         cli_log "${2:-}"
         exit 0
         ;;
-    wait-ready)
-        cli_wait_ready "${2:-}"
-        ;;
     "")
         ;;
     *)
-        echo "Usage: $0 [status|sync|log [N]|wait-ready [timeout_seconds]]" >&2
+        echo "Usage: $0 [status|sync|log [N]]" >&2
         echo "  (no argument)  run the daemon loop" >&2
         exit 1
         ;;
@@ -1045,7 +1000,6 @@ while true; do
 
     elapsed_since_sync=0
     logout_confirm_count=0
-    real_login_seen=0
     while true; do
         responsive_sleep "$CLEAN_INTERVAL"
         cleanup_stale_files
@@ -1069,12 +1023,7 @@ while true; do
         fi
 
         if [ "$(get_logged_in_users)" -gt 0 ]; then
-            real_login_seen=1
             logout_confirm_count=0
-            continue
-        fi
-
-        if [ "$real_login_seen" -eq 0 ]; then
             continue
         fi
 
