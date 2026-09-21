@@ -40,6 +40,17 @@ SYNC_INTERVAL=300
 
 PERSIST_ROOT="/persist"
 
+SESSION_DIRS=(/run/systemd/sessions /run/elogind/sessions)
+MIN_HUMAN_UID=1000
+
+GREETER_SETTLE_SECONDS=5
+
+KEEP_VAR_CACHE_DIRS=(lightdm)
+
+INIT_PROTECT_DIRS=(/etc/runit /etc/sv /etc/service)
+
+LATE_START_SKIP_TMPFS=1
+
 BIND_MOUNTED_VAR_CACHE=(pacman)
 BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db)
 
@@ -55,6 +66,9 @@ EAGER_SYNC_DIRS=(
 EXCLUDED_FROM_SYNC=(
     "/var/lib/systemd"
     "/var/log/journal"
+)
+
+EXCLUDED_FROM_OVERLAY=(
 )
 
 USE_LSOF=0
@@ -87,11 +101,59 @@ is_degraded() {
 compute_exclude_opts() {
     local dir="$1"
     local excl
-    for excl in "${EXCLUDED_FROM_SYNC[@]}"; do
+    for excl in "${EXCLUDED_FROM_SYNC[@]}" "${EXCLUDED_FROM_OVERLAY[@]}"; do
         if [[ "$excl" == "$dir"* ]]; then
             echo "--exclude=${excl#"$dir"/}"
         fi
     done
+}
+
+get_overlay_excludes_for_dir() {
+    local dir="$1"
+    local excl
+    for excl in "${EXCLUDED_FROM_OVERLAY[@]}"; do
+        if [[ "$excl" == "$dir"/* ]]; then
+            echo "${excl#"$dir"/}"
+        fi
+    done
+}
+
+apply_overlay_excludes() {
+    local target_dir="$1"
+    local lower_dir="$LOWER_ROOT${target_dir}"
+    local rel excl_target excl_lower
+
+    while IFS= read -r rel; do
+        [ -z "$rel" ] && continue
+        excl_target="$target_dir/$rel"
+        excl_lower="$lower_dir/$rel"
+
+        if [ ! -e "$excl_lower" ]; then
+            log "$excl_target not found, skipping overlay exclusion"
+            continue
+        fi
+
+        if mountpoint -q -- "$excl_target"; then
+            log "$excl_target already a mountpoint, skipping overlay exclusion"
+            continue
+        fi
+
+        if mount --bind "$excl_lower" "$excl_target"; then
+            log "Excluded $excl_target from RAM overlay (bound directly to disk)"
+        else
+            log "ERROR: Failed to exclude $excl_target from overlay"
+        fi
+    done < <(get_overlay_excludes_for_dir "$target_dir")
+}
+
+remove_overlay_excludes() {
+    local target_dir="$1"
+    local rel
+
+    while IFS= read -r rel; do
+        [ -z "$rel" ] && continue
+        umount_try "$target_dir/$rel" || log "ERROR: Failed to unmount excluded $target_dir/$rel"
+    done < <(get_overlay_excludes_for_dir "$target_dir")
 }
 
 declare -A INUSE_SET
@@ -453,12 +515,42 @@ start_tmpfs_mounts() {
 
     migrate_to_persist /var/cache "${BIND_MOUNTED_VAR_CACHE[@]}"
 
-    mount_tmpfs /tmp "$TMP_SIZE" 1777 || log "WARNING: /tmp will remain on disk"
+    local skip_live=0
+    if [ "$LATE_START_SKIP_TMPFS" -eq 1 ] && [ "${START_TRIGGER:-}" = "human" ]; then
+        skip_live=1
+        log "A user session is already running: leaving /tmp and ~/.cache on disk until the next cycle"
+    fi
+
+    if [ "$skip_live" -eq 0 ]; then
+        mount_tmpfs /tmp "$TMP_SIZE" 1777 || log "WARNING: /tmp will remain on disk"
+    fi
     mount_tmpfs /var/tmp "$VAR_TMP_SIZE" 1777 || log "WARNING: /var/tmp will remain on disk"
+    # tmpfs over /var/cache hides directories that packages created on disk
+    # (LightDM's default cache-directory is /var/cache/lightdm). Remember the
+    # owner/mode of the ones listed in KEEP_VAR_CACHE_DIRS and recreate them.
+    local -A keep_meta=()
+    local kd
+    for kd in "${KEEP_VAR_CACHE_DIRS[@]}"; do
+        [ -d "/var/cache/$kd" ] && keep_meta["$kd"]=$(stat -c '%u:%g %a' "/var/cache/$kd" 2>/dev/null)
+    done
+
     mount_tmpfs /var/cache "$VAR_CACHE_SIZE" 0755 || log "WARNING: /var/cache will remain on disk"
 
+    if mountpoint -q -- /var/cache; then
+        for kd in "${!keep_meta[@]}"; do
+            [ -d "/var/cache/$kd" ] && continue
+            if mkdir -p "/var/cache/$kd" \
+                && chown "${keep_meta[$kd]%% *}" "/var/cache/$kd" \
+                && chmod "${keep_meta[$kd]##* }" "/var/cache/$kd"; then
+                log "Recreated /var/cache/$kd on tmpfs (owner/mode ${keep_meta[$kd]})"
+            else
+                log "WARNING: could not recreate /var/cache/$kd"
+            fi
+        done
+    fi
+
     bind_persist_dirs /var/cache "${BIND_MOUNTED_VAR_CACHE[@]}"
-    mount_user_caches
+    [ "$skip_live" -eq 0 ] && mount_user_caches
 
     log "tmpfs mounts completed."
 }
@@ -502,6 +594,60 @@ create_overlay_base() {
     return 1
 }
 
+INIT_PROTECT_ACTIVE=0
+SUPERVISOR_FROZEN=""
+
+# Called once per overlay start: if runit is supervising and /etc gets overlaid,
+# add the supervision directories to the exclusion list.
+protect_init_dirs() {
+    INIT_PROTECT_ACTIVE=0
+    pgrep -x runsvdir >/dev/null 2>&1 || return 0
+
+    local o d e known has_etc=0 added=()
+    for o in "${OVERLAY_DIRS[@]}"; do
+        [ "$o" = "/etc" ] && has_etc=1
+    done
+    [ "$has_etc" -eq 1 ] || return 0
+
+    for d in "${INIT_PROTECT_DIRS[@]}"; do
+        # a symlink (e.g. /etc/service -> /run/...) points outside /etc: nothing to protect
+        { [ -d "$d" ] && [ ! -L "$d" ]; } || continue
+        known=0
+        for e in "${EXCLUDED_FROM_OVERLAY[@]}"; do
+            [ "$e" = "$d" ] && known=1
+        done
+        [ "$known" -eq 1 ] || EXCLUDED_FROM_OVERLAY+=("$d")
+        added+=("$d")
+    done
+
+    if [ "${#added[@]}" -gt 0 ]; then
+        INIT_PROTECT_ACTIVE=1
+        log "runit (runsvdir) detected: keeping ${added[*]} on disk and pausing runsvdir during the /etc swap so services are not restarted"
+    fi
+}
+
+# Pause runsvdir while /etc (or something below it) is mounted/unmounted, so it
+# cannot rescan in the millisecond window between the overlay mount and the bind
+# that restores the excluded directories.
+freeze_supervisors() {
+    [ "$INIT_PROTECT_ACTIVE" -eq 1 ] || return 0
+    case "$1" in /etc|/etc/*) ;; *) return 0 ;; esac
+    local pids
+    pids=$(pgrep -x runsvdir 2>/dev/null | tr '\n' ' ')
+    [ -n "$pids" ] || return 0
+    # dead-man's switch: resume them after 3s even if this script dies mid-swap
+    ( sleep 3; kill -CONT $pids 2>/dev/null ) >/dev/null 2>&1 &
+    if kill -STOP $pids 2>/dev/null; then
+        SUPERVISOR_FROZEN="$pids"
+    fi
+}
+
+thaw_supervisors() {
+    [ -n "$SUPERVISOR_FROZEN" ] || return 0
+    kill -CONT $SUPERVISOR_FROZEN 2>/dev/null
+    SUPERVISOR_FROZEN=""
+}
+
 create_directory_overlay() {
     local target_dir="$1"
     local prepopulate="${2:-1}"
@@ -539,25 +685,34 @@ create_directory_overlay() {
             log "WARNING: Pre-population rsync for $target_dir had errors (non-fatal)"
     fi
 
+    freeze_supervisors "$target_dir"
     log "Mounting overlay on $target_dir..."
 
+    local mounted=0
     if mount -t overlay "overlay_${dir_name}" \
         -o "lowerdir=${lower_dir},upperdir=${upper_dir},workdir=${work_dir},metacopy=off,noatime" \
         "$target_dir" 2>/dev/null; then
         log "Successfully mounted RAM overlay on $target_dir (metacopy=off)"
-        return 0
+        mounted=1
+    else
+        log "WARNING: Mount with metacopy=off failed, retrying without it..."
+        if mount -t overlay "overlay_${dir_name}" \
+            -o "lowerdir=${lower_dir},upperdir=${upper_dir},workdir=${work_dir},noatime" \
+            "$target_dir" 2>/dev/null; then
+            log "Successfully mounted RAM overlay on $target_dir (metacopy not supported on this kernel)"
+            mounted=1
+        fi
     fi
 
-    log "WARNING: Mount with metacopy=off failed, retrying without it..."
-    if mount -t overlay "overlay_${dir_name}" \
-        -o "lowerdir=${lower_dir},upperdir=${upper_dir},workdir=${work_dir},noatime" \
-        "$target_dir" 2>/dev/null; then
-        log "Successfully mounted RAM overlay on $target_dir (metacopy not supported on this kernel)"
-        return 0
+    if [ "$mounted" -eq 0 ]; then
+        thaw_supervisors
+        log "ERROR: Failed to mount overlay on $target_dir — writes will go directly to disk"
+        return 1
     fi
 
-    log "ERROR: Failed to mount overlay on $target_dir — writes will go directly to disk"
-    return 1
+    apply_overlay_excludes "$target_dir"
+    thaw_supervisors
+    return 0
 }
 
 start_overlay() {
@@ -568,6 +723,7 @@ start_overlay() {
 
     log "Starting unified RAM overlay system..."
 
+    protect_init_dirs
     start_tmpfs_mounts
 
     if ! create_overlay_base; then
@@ -756,7 +912,10 @@ stop_overlay() {
     log "Unmounting overlay filesystems..."
     for ((i=${#OVERLAY_DIRS[@]}-1; i>=0; i--)); do
         local dir="${OVERLAY_DIRS[i]}"
+        freeze_supervisors "$dir"
+        remove_overlay_excludes "$dir"
         umount_try "$dir" || log "ERROR: Failed to unmount $dir"
+        thaw_supervisors
         umount_try "$LOWER_ROOT$dir" || log "ERROR: Failed to unmount $LOWER_ROOT$dir"
     done
 
@@ -776,28 +935,74 @@ stop_overlay() {
     : > "$LOG_FILE"
 }
 
-get_logged_in_users() {
-    local count=0 c
+# Prints "<who> <sessions> <x11> <wayland>": one count per login signal.
+#
+# Only human logins count. A display manager's greeter has its own logind
+# session, its own X server socket and a system uid, so counting it would make
+# the daemon believe a user logged in the moment LightDM/SDDM comes up (and,
+# after a logout, the fresh greeter would keep it from ever noticing).
+login_signal_counts() {
+    local who_n=0 sess_n=0 x_n=0 wl_n=0
+    local dir f w line cls uid
 
-    c=$(who 2>/dev/null | awk '{print $1}' | sort -u | wc -l)
-    [ "$c" -gt "$count" ] && count=$c
+    # 1. tty/utmp logins: root or a regular user, never a service account.
+    who_n=$(who 2>/dev/null | awk -v min="$MIN_HUMAN_UID" '
+        BEGIN { while ((getline l < "/etc/passwd") > 0) { split(l, f, ":"); id[f[1]] = f[3] } }
+        ($1 in id) && (id[$1] == 0 || id[$1] >= min) && !seen[$1]++ { n++ }
+        END { print n + 0 }')
 
-    if command -v loginctl >/dev/null 2>&1; then
-        c=$(loginctl list-sessions --no-legend 2>/dev/null | wc -l)
-        [ "$c" -gt "$count" ] && count=$c
-    fi
+    # 2. elogind session records (class "user" only; greeter/lock-screen and
+    #    background sessions are ignored). Reading the state dir instead of
+    #    running `loginctl` avoids a D-Bus call, and D-Bus activating elogind,
+    #    once a second while the system is still booting.
+    for dir in "${SESSION_DIRS[@]}"; do
+        [ -d "$dir" ] || continue
+        for f in "$dir"/*; do
+            [ -f "$f" ] || continue
+            cls="" uid=""
+            while IFS= read -r line; do
+                case "$line" in
+                    CLASS=*) cls=${line#CLASS=} ;;
+                    UID=*)   uid=${line#UID=} ;;
+                esac
+            done < "$f"
+            if [ "$cls" = "user" ] || { [ -z "$cls" ] && [ "${uid:-0}" -ge "$MIN_HUMAN_UID" ] 2>/dev/null; }; then
+                sess_n=$((sess_n + 1))
+            fi
+        done
+    done
+    # NOTE: deliberately no `loginctl` fallback. Before elogind has created its
+    # state directory (i.e. early boot) that would be a D-Bus call to a name
+    # nobody owns yet, which makes D-Bus *activate* elogind once a second and
+    # races with the init system's own elogind start.
 
+    # 3. X servers owned by a human uid (startx-style). The DM's root/system
+    #    owned greeter server is ignored.
     if [ -d /tmp/.X11-unix ]; then
-        c=$(find /tmp/.X11-unix -maxdepth 1 -name 'X*' -type s 2>/dev/null | wc -l)
-        [ "$c" -gt "$count" ] && count=$c
+        x_n=$(find /tmp/.X11-unix -maxdepth 1 -name 'X*' -type s \
+                -uid +$((MIN_HUMAN_UID - 1)) 2>/dev/null | wc -l)
     fi
 
+    # 4. Wayland sockets belonging to human uids.
     shopt -s nullglob
-    local wl=(/run/user/[0-9]*/wayland-[0-9]*)
+    for w in /run/user/[0-9]*/wayland-[0-9]*; do
+        [ -S "$w" ] || continue
+        uid=${w#/run/user/}
+        uid=${uid%%/*}
+        [ "$uid" -ge "$MIN_HUMAN_UID" ] && wl_n=$((wl_n + 1))
+    done
     shopt -u nullglob
-    [ "${#wl[@]}" -gt "$count" ] && count=${#wl[@]}
 
-    echo "$count"
+    echo "$who_n $sess_n $x_n $wl_n"
+}
+
+get_logged_in_users() {
+    local a b c d n max=0
+    read -r a b c d <<< "$(login_signal_counts)"
+    for n in "${a:-0}" "${b:-0}" "${c:-0}" "${d:-0}"; do
+        [ "$n" -gt "$max" ] && max=$n
+    done
+    echo "$max"
 }
 
 responsive_sleep() {
@@ -808,19 +1013,69 @@ responsive_sleep() {
     done
 }
 
+# Number of display-manager greeter sessions logind reports (files only, no D-Bus).
+count_greeter_sessions() {
+    local dir f line n=0
+    for dir in "${SESSION_DIRS[@]}"; do
+        [ -d "$dir" ] || continue
+        for f in "$dir"/*; do
+            [ -f "$f" ] || continue
+            while IFS= read -r line; do
+                if [ "$line" = "CLASS=greeter" ]; then
+                    n=$((n + 1))
+                    break
+                fi
+            done < "$f"
+        done
+    done
+    echo "$n"
+}
+
+have_session_dir() {
+    local d
+    for d in "${SESSION_DIRS[@]}"; do
+        [ -d "$d" ] && return 0
+    done
+    return 1
+}
+
 wait_for_login() {
-    log "Waiting for user login..."
+    log "Waiting for user login (or an idle display-manager greeter)..."
+    local waited=0 warned=0 greeter_secs=0
+    START_TRIGGER=""
 
     while true; do
         local users
         users=$(get_logged_in_users)
 
         if [ "$users" -gt 0 ]; then
-            log "User login detected ($users users)"
+            log "User login detected ($users user(s); who/sessions/x11/wayland = $(login_signal_counts))"
+            START_TRIGGER="human"
             return 0
         fi
 
+        # A greeter that has been showing for a few seconds means the display
+        # manager is up and idle: mount now, before the user starts logging in.
+        if [ "$GREETER_SETTLE_SECONDS" -gt 0 ]; then
+            if [ "$(count_greeter_sessions)" -gt 0 ]; then
+                greeter_secs=$((greeter_secs + 1))
+                if [ "$greeter_secs" -ge "$GREETER_SETTLE_SECONDS" ]; then
+                    log "Display-manager greeter idle for ~${greeter_secs}s - starting overlay before login"
+                    START_TRIGGER="greeter"
+                    return 0
+                fi
+            else
+                greeter_secs=0
+            fi
+        fi
+
         responsive_sleep 1
+
+        waited=$((waited + 1))
+        if [ "$warned" -eq 0 ] && [ "$waited" -ge 120 ] && ! have_session_dir; then
+            warned=1
+            log "WARNING: no elogind session directory found (tried: ${SESSION_DIRS[*]}); only tty/X11/Wayland logins can be detected. Set SESSION_DIRS if elogind keeps its state elsewhere."
+        fi
     done
 }
 
@@ -829,6 +1084,7 @@ CLEANUP_DONE=0
 shutdown_cleanup() {
     [ "$CLEANUP_DONE" -eq 1 ] && exit 0
     CLEANUP_DONE=1
+    thaw_supervisors
 
     log "Shutdown/reboot signal received - syncing all changes to disk..."
     stop_overlay
@@ -946,6 +1202,9 @@ touch "$LOG_FILE" || true
 
 log "Unified RAM overlay daemon started (PID: $$)"
 log "Overlay directories: ${OVERLAY_DIRS[*]}"
+if ! command -v rsync >/dev/null 2>&1; then
+    log "WARNING: rsync not found in PATH ($PATH) - the overlay cannot pre-populate or sync back to disk. Install rsync."
+fi
 if [ "$USE_LSOF" -eq 1 ]; then
     log "Using lsof to detect open files (batched once per cleanup pass)"
 elif [ "$USE_FUSER" -eq 1 ]; then
@@ -977,6 +1236,11 @@ while true; do
 
     elapsed_since_sync=0
     logout_confirm_count=0
+    # The overlay may have been started from an idle greeter, before anyone
+    # logged in. "No users" is only a logout once a human has been seen.
+    seen_human=0
+    [ "$START_TRIGGER" = "human" ] && seen_human=1
+    [ "$(get_logged_in_users)" -gt 0 ] && seen_human=1
     while true; do
         responsive_sleep "$CLEAN_INTERVAL"
         cleanup_stale_files
@@ -1000,7 +1264,16 @@ while true; do
         fi
 
         if [ "$(get_logged_in_users)" -gt 0 ]; then
+            if [ "$seen_human" -eq 0 ]; then
+                log "First user login since the overlay started"
+            fi
+            seen_human=1
             logout_confirm_count=0
+            continue
+        fi
+
+        # Nobody has logged in yet (overlay is waiting behind an idle greeter).
+        if [ "$seen_human" -eq 0 ]; then
             continue
         fi
 
