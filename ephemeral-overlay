@@ -263,6 +263,48 @@ bind_persist_dirs() {
     done
 }
 
+bind_user_cache_persist_dirs() {
+    [ "${#BIND_MOUNTED_USER_CACHE[@]}" -eq 0 ] && return 0
+    local users
+    users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }')
+    while IFS=: read -r username homedir; do
+        if [ -z "$username" ] || [ -z "$homedir" ]; then continue; fi
+        [ -d "$homedir" ] || continue
+        local cache_dir="$homedir/.cache"
+        local user_stat
+        user_stat=$(stat -c "%u:%g" "$homedir" 2>/dev/null) || continue
+        local uid=${user_stat%:*}
+        local gid=${user_stat#*:}
+
+        if [ ! -d "$cache_dir" ]; then
+            mkdir -p "$cache_dir"
+            chown "${uid}:${gid}" "$cache_dir"
+            chmod 0700 "$cache_dir"
+        fi
+
+        # A tmpfs already over the whole of ~/.cache means mount_user_caches
+        # ran this cycle and already bound these directories inside it.
+        if mountpoint -q -- "$cache_dir"; then
+            continue
+        fi
+
+        migrate_to_persist "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
+        bind_persist_dirs "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
+
+        local subdir
+        for subdir in "${BIND_MOUNTED_USER_CACHE[@]}"; do
+            local d="$cache_dir/$subdir"
+            if [ -d "$d" ]; then
+                local cur_owner
+                cur_owner=$(stat -c "%u:%g" "$d" 2>/dev/null) || cur_owner=""
+                if [ "$cur_owner" != "${uid}:${gid}" ]; then
+                    chown -R "${uid}:${gid}" "$d" || true
+                fi
+            fi
+        done
+    done <<< "$users"
+}
+
 mount_user_caches() {
     local users
     users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }')
@@ -518,7 +560,7 @@ start_tmpfs_mounts() {
     local skip_live=0
     if [ "$LATE_START_SKIP_TMPFS" -eq 1 ] && [ "${START_TRIGGER:-}" = "human" ]; then
         skip_live=1
-        log "A user session is already running: leaving /tmp and ~/.cache on disk until the next cycle"
+        log "A user session is already running: leaving /tmp and ~/.cache on disk until the next cycle (persisted ~/.cache subdirectories are still bind-mounted)"
     fi
 
     if [ "$skip_live" -eq 0 ]; then
@@ -550,7 +592,11 @@ start_tmpfs_mounts() {
     fi
 
     bind_persist_dirs /var/cache "${BIND_MOUNTED_VAR_CACHE[@]}"
-    [ "$skip_live" -eq 0 ] && mount_user_caches
+    if [ "$skip_live" -eq 0 ]; then
+        mount_user_caches
+    else
+        bind_user_cache_persist_dirs
+    fi
 
     log "tmpfs mounts completed."
 }
