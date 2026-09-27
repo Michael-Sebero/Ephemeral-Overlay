@@ -1,28 +1,22 @@
 #!/bin/bash
 
 set -o pipefail
+shopt -s nullglob
 
-if [ -r /usr/lib/libmimalloc.so ]; then
-    RSYNC="env LD_PRELOAD=/usr/lib/libmimalloc.so rsync"
-    FIND="env LD_PRELOAD=/usr/lib/libmimalloc.so find"
-    INOTIFYWAIT="env LD_PRELOAD=/usr/lib/libmimalloc.so inotifywait"
-else
-    RSYNC="rsync"
-    FIND="find"
-    INOTIFYWAIT="inotifywait"
-fi
+PRELOAD=()
+[ -r /usr/lib/libmimalloc.so ] && PRELOAD=(env LD_PRELOAD=/usr/lib/libmimalloc.so)
+RSYNC=("${PRELOAD[@]}" rsync)
+FIND=("${PRELOAD[@]}" find)
+INOTIFYWAIT=("${PRELOAD[@]}" inotifywait)
 
 # USER MODIFICATION SECTION
 
 OVERLAY_BASE="/ram_overlay"
 LOWER_ROOT="/var/lib/ramoverlay/lower"
+RUN_DIR="/var/run/ramoverlay"
 STATE_FILE="/var/run/ramoverlay.state"
 DAEMON_PIDFILE="/var/run/ramoverlay-daemon.pid"
 LOG_FILE="/var/log/ramoverlay.log"
-INOTIFY_QUEUE="/var/run/ramoverlay-inotify.queue"
-INOTIFY_PIDFILE="/var/run/ramoverlay-inotify.pid"
-EAGER_INOTIFY_QUEUE="/var/run/ramoverlay-inotify-eager.queue"
-EAGER_INOTIFY_PIDFILE="/var/run/ramoverlay-inotify-eager.pid"
 
 TMP_SIZE="5G"
 VAR_TMP_SIZE="1G"
@@ -32,11 +26,13 @@ OVERLAY_BASE_SIZE="50%"
 
 CLEAN_INTERVAL=30
 STALE_MINUTES=5
+MEM_WARN_PERCENT=10
 
 LOGOUT_CONFIRM_CHECKS=3
 LOGOUT_CONFIRM_INTERVAL=10
 
 SYNC_INTERVAL=300
+SYNC_LOCK_TIMEOUT=600
 
 PERSIST_ROOT="/persist"
 
@@ -50,8 +46,9 @@ KEEP_VAR_CACHE_DIRS=(lightdm)
 INIT_PROTECT_DIRS=(/etc/runit /etc/sv /etc/service)
 
 LATE_START_SKIP_TMPFS=1
+SKIP_TMP_WITH_LIVE_X=1
 
-BIND_MOUNTED_VAR_CACHE=(pacman)
+BIND_MOUNTED_VAR_CACHE=(pacman xbps)
 BIND_MOUNTED_USER_CACHE=(paru nvidia mesa_shader_cache mesa_shader_cache_db)
 
 OVERLAY_DIRS=(
@@ -71,6 +68,16 @@ EXCLUDED_FROM_SYNC=(
 EXCLUDED_FROM_OVERLAY=(
 )
 
+OVERLAY_MOUNT_OPTS=(
+    "redirect_dir=nofollow,metacopy=off,index=off,xino=auto"
+    "redirect_dir=off"
+    ""
+)
+
+HAVE_RSYNC=0
+command -v rsync >/dev/null 2>&1 && HAVE_RSYNC=1
+HAVE_INOTIFY=0
+command -v inotifywait >/dev/null 2>&1 && HAVE_INOTIFY=1
 USE_LSOF=0
 USE_FUSER=0
 if command -v lsof >/dev/null 2>&1; then
@@ -79,509 +86,316 @@ elif command -v fuser >/dev/null 2>&1; then
     USE_FUSER=1
 fi
 
+MOUNTS_FILE=""
+SYNC_LOCK=""
+DAEMON_LOCK=""
+LOWER_REAL=""
+SNOOZE_FD=""
+START_TRIGGER=""
+INIT_PROTECT_ACTIVE=0
+SUPERVISOR_FROZEN=()
+DEADMAN_PID=""
+MEM_LOW=0
+CLEANUP_DONE=0
+PRUNED=0
+CACHE_OWNER=""
+ACTIVE=()
+SKIPS=()
+WHITEOUTS=()
+DEVICES=()
+HOME_USERS=()
+HOME_DIRS=()
+declare -A SKIP_SET=()
+declare -A MT_FSTYPE=()
+declare -A INUSE_SET=()
+
+init_paths() {
+    MOUNTS_FILE="$RUN_DIR/mounts"
+    SYNC_LOCK="$RUN_DIR/sync.lock"
+    DAEMON_LOCK="$RUN_DIR/daemon.lock"
+}
+
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+    local line
+    printf -v line '[%(%Y-%m-%d %H:%M:%S)T] %s' -1 "$*"
+    printf '%s\n' "$line"
+    { printf '%s\n' "$line" >> "$LOG_FILE"; } 2>/dev/null
+    return 0
 }
 
 check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        log "ERROR: Must be run as root"
-        exit 1
-    fi
+    [ "$EUID" -eq 0 ] && return 0
+    echo "FAIL: must be run as root" >&2
+    return 1
 }
 
-is_active() {
-    [ -f "$STATE_FILE" ] && grep -qxE "active|degraded" "$STATE_FILE"
+snooze() {
+    [ -n "$SNOOZE_FD" ] || exec {SNOOZE_FD}<> <(:)
+    read -r -t "$1" -u "$SNOOZE_FD" _ 2>/dev/null
+    return 0
 }
 
-is_degraded() {
-    [ -f "$STATE_FILE" ] && grep -qx "degraded" "$STATE_FILE"
+valid_dir() {
+    case $1 in
+        /|*/|*//*|*/./*|*/../*|*/.|*/..|*[,:\\[:space:]]*) return 1 ;;
+        /*) return 0 ;;
+    esac
+    return 1
 }
 
-compute_exclude_opts() {
-    local dir="$1"
-    local excl
-    for excl in "${EXCLUDED_FROM_SYNC[@]}" "${EXCLUDED_FROM_OVERLAY[@]}"; do
-        if [[ "$excl" == "$dir"* ]]; then
-            echo "--exclude=${excl#"$dir"/}"
-        fi
-    done
-}
-
-get_overlay_excludes_for_dir() {
-    local dir="$1"
-    local excl
-    for excl in "${EXCLUDED_FROM_OVERLAY[@]}"; do
-        if [[ "$excl" == "$dir"/* ]]; then
-            echo "${excl#"$dir"/}"
-        fi
-    done
-}
-
-apply_overlay_excludes() {
-    local target_dir="$1"
-    local lower_dir="$LOWER_ROOT${target_dir}"
-    local rel excl_target excl_lower
-
-    while IFS= read -r rel; do
-        [ -z "$rel" ] && continue
-        excl_target="$target_dir/$rel"
-        excl_lower="$lower_dir/$rel"
-
-        if [ ! -e "$excl_lower" ]; then
-            log "$excl_target not found, skipping overlay exclusion"
+validate_config() {
+    local -a keep=()
+    local d o bad
+    for d in "${OVERLAY_DIRS[@]}"; do
+        if ! valid_dir "$d"; then
+            log "ERROR: ignoring OVERLAY_DIRS entry '$d' (needs an absolute path without a trailing slash, '.', '..', commas, colons, backslashes or whitespace)"
             continue
         fi
-
-        if mountpoint -q -- "$excl_target"; then
-            log "$excl_target already a mountpoint, skipping overlay exclusion"
+        bad=0
+        for o in "${OVERLAY_DIRS[@]}" "${keep[@]}"; do
+            [[ $d == "$o"/* ]] && bad=1
+        done
+        for o in "${keep[@]}"; do
+            [ "$o" = "$d" ] && bad=1
+        done
+        if [ "$bad" -eq 1 ]; then
+            log "ERROR: ignoring OVERLAY_DIRS entry $d (duplicate or nested inside another entry)"
             continue
         fi
-
-        if mount --bind "$excl_lower" "$excl_target"; then
-            log "Excluded $excl_target from RAM overlay (bound directly to disk)"
-        else
-            log "ERROR: Failed to exclude $excl_target from overlay"
-        fi
-    done < <(get_overlay_excludes_for_dir "$target_dir")
+        keep+=("$d")
+    done
+    OVERLAY_DIRS=("${keep[@]}")
 }
 
-remove_overlay_excludes() {
-    local target_dir="$1"
-    local rel
-
-    while IFS= read -r rel; do
-        [ -z "$rel" ] && continue
-        umount_try "$target_dir/$rel" || log "ERROR: Failed to unmount excluded $target_dir/$rel"
-    done < <(get_overlay_excludes_for_dir "$target_dir")
+rsync_literal() {
+    REPLY=$1
+    case $REPLY in
+        *[*?[]*)
+            REPLY=${REPLY//\\/\\\\}
+            REPLY=${REPLY//\*/\\*}
+            REPLY=${REPLY//\?/\\?}
+            REPLY=${REPLY//\[/\\[}
+            ;;
+    esac
 }
 
-declare -A INUSE_SET
+load_mount_table() {
+    local _id _pid _dev _root mp _opts rest
+    MT_FSTYPE=()
+    while read -r _id _pid _dev _root mp _opts rest; do
+        mp=${mp//\\/\\0}
+        printf -v mp '%b' "$mp"
+        rest=" $rest"
+        rest=${rest#* - }
+        MT_FSTYPE[$mp]=${rest%% *}
+    done < /proc/self/mountinfo
+}
 
-build_inuse_index() {
-    INUSE_SET=()
+is_our_overlay() {
+    local fs src
+    read -r fs src < <(findmnt -n -o FSTYPE,SOURCE --target "$1" 2>/dev/null)
+    [ "$fs" = overlay ] && [ "$src" = "ramoverlay${1//\//_}" ]
+}
 
-    if [ "$USE_LSOF" -eq 1 ]; then
-        local line
-        while IFS= read -r line; do
-            [ "${line:0:1}" = "n" ] && INUSE_SET["${line:1}"]=1
-        done < <(lsof -Fn 2>/dev/null)
+track() {
+    printf '%s\t%s\t%s\n' "$1" "$2" "${3:--}" >> "$MOUNTS_FILE"
+}
+
+load_active() {
+    local k t _
+    ACTIVE=()
+    [ -f "$MOUNTS_FILE" ] || return 0
+    while IFS=$'\t' read -r k t _; do
+        [ "$k" = overlay ] && ACTIVE+=("$t")
+    done < "$MOUNTS_FILE"
+}
+
+in_active() {
+    local d
+    for d in "${ACTIVE[@]}"; do
+        [ "$d" = "$1" ] && return 0
+    done
+    return 1
+}
+
+umount_path() {
+    mountpoint -q -- "$1" 2>/dev/null || return 0
+    if umount "$1" 2>/dev/null; then
+        log "Unmounted $1"
         return 0
     fi
-
-    if [ "$USE_FUSER" -eq 1 ]; then
-        return 0
+    if umount -l "$1" 2>/dev/null; then
+        log "WARNING: $1 was busy and has been lazily detached"
+        return 2
     fi
-
-    local fds=(/proc/[0-9]*/fd/*)
-    [ -e "${fds[0]}" ] || return 0
-    local target
-    while IFS= read -r target; do
-        [ -n "$target" ] && INUSE_SET["$target"]=1
-    done < <(readlink -f -- "${fds[@]}" 2>/dev/null)
+    log "ERROR: could not unmount $1"
+    return 1
 }
 
-is_file_in_use() {
-    local file="$1"
-    [ -e "$file" ] || return 1
-
-    if [ "$USE_FUSER" -eq 1 ] && [ "$USE_LSOF" -ne 1 ]; then
-        fuser -s -- "$file" >/dev/null 2>&1
-        return $?
-    fi
-
-    local real
-    real="$(readlink -f -- "$file" 2>/dev/null)" || real="$file"
-    [ -n "${INUSE_SET[$real]+x}" ]
+bind_mount() {
+    mount --bind "$1" "$2" || return 1
+    track "$3" "$2" "${4:-}"
 }
 
 mount_tmpfs() {
-    local dir="$1" size="$2" mode="$3"
-    mkdir -p -- "$dir"
+    local dir=$1 opts="size=$2,mode=$3${4:+,$4}"
+    mkdir -p -- "$dir" || return 1
     if mountpoint -q -- "$dir"; then
-        log "$dir already mounted, skipping."
+        log "$dir is already a mountpoint, leaving it alone"
         return 0
     fi
-    log "Mounting tmpfs on $dir (size=$size mode=$mode)..."
-    if mount -t tmpfs -o "size=${size},mode=${mode},noswap" none "$dir" 2>/dev/null; then
+    if mount -t tmpfs -o "$opts,noswap" tmpfs "$dir" 2>/dev/null || mount -t tmpfs -o "$opts" tmpfs "$dir"; then
+        track tmpfs "$dir"
+        log "Mounted tmpfs on $dir ($opts)"
         return 0
     fi
-    if mount -t tmpfs -o "size=${size},mode=${mode}" none "$dir"; then
-        return 0
-    fi
-    log "ERROR: Failed to mount tmpfs on $dir"
+    log "ERROR: failed to mount tmpfs on $dir"
     return 1
 }
 
 migrate_to_persist() {
-    local parent="$1"
+    local parent=$1 d src dest
+    local -a contents
     shift
-    local dirs=("$@")
-    local persist_root="${PERSIST_ROOT}${parent}"
-    mkdir -p "$persist_root" || { log "ERROR: failed to mkdir $persist_root"; return 1; }
-
-    local d
-    for d in "${dirs[@]}"; do
-        local src="$persist_root/$d"
-        local dest="$parent/$d"
-
-        if [ -d "$dest" ] && [ ! -e "$src" ] && [ -n "$(ls -A "$dest" 2>/dev/null || true)" ]; then
-            log "Moving existing $dest -> $src (first-run persistence)"
-            mkdir -p "$(dirname "$src")"
-            if command -v rsync >/dev/null 2>&1; then
-                $RSYNC -a --remove-source-files "$dest"/ "$src"/ || true
-                $FIND "$dest" -mindepth 1 -type d -empty -delete || true
-            else
-                mv "$dest" "$src" || true
-            fi
+    for d in "$@"; do
+        src="$PERSIST_ROOT$parent/$d"
+        dest="$parent/$d"
+        if [ ! -d "$dest" ] || [ -e "$src" ]; then
+            continue
         fi
+        contents=("$dest"/* "$dest"/.[!.]* "$dest"/..?*)
+        [ ${#contents[@]} -gt 0 ] || continue
+        log "Moving existing $dest -> $src (first-run persistence)"
+        mkdir -p -- "${src%/*}" || continue
+        mv -- "$dest" "$src" || log "WARNING: could not move $dest to $src"
     done
 }
 
 bind_persist_dirs() {
-    local parent="$1"
+    local parent=$1 d src dest
     shift
-    local dirs=("$@")
-    local persist_root="${PERSIST_ROOT}${parent}"
-
-    local d
-    for d in "${dirs[@]}"; do
-        local src="$persist_root/$d"
-        local dest="$parent/$d"
-
-        mkdir -p "$src" "$dest"
-
-        if ! mountpoint -q "$dest"; then
-            if mount --bind "$src" "$dest"; then
-                log "Bind-mounted $src -> $dest"
-            else
-                log "ERROR: Failed to bind-mount $src -> $dest"
-            fi
+    for d in "$@"; do
+        src="$PERSIST_ROOT$parent/$d"
+        dest="$parent/$d"
+        mkdir -p -- "$src" "$dest" || continue
+        if mountpoint -q -- "$dest"; then
+            log "$dest is already a mountpoint, skipping bind"
+        elif bind_mount "$src" "$dest" bind; then
+            log "Bind-mounted $src -> $dest"
         else
-            log "$dest already a mountpoint, skipping bind."
+            log "ERROR: failed to bind-mount $src -> $dest"
         fi
+    done
+}
+
+load_human_homes() {
+    local user _pw uid _gid _gecos home _shell
+    HOME_USERS=()
+    HOME_DIRS=()
+    while IFS=: read -r user _pw uid _gid _gecos home _shell; do
+        [[ $uid =~ ^[0-9]+$ ]] || continue
+        if [ "$uid" -lt "$MIN_HUMAN_UID" ] || [ "$uid" -ge 65534 ]; then
+            continue
+        fi
+        if [[ $home != /home/* ]] || [ ! -d "$home" ]; then
+            continue
+        fi
+        HOME_USERS+=("$user")
+        HOME_DIRS+=("$home")
+    done < <(getent passwd)
+}
+
+prepare_cache_dir() {
+    CACHE_OWNER=$(stat -c '%u:%g' -- "$1" 2>/dev/null) || return 1
+    [ -d "$1/.cache" ] && return 0
+    mkdir -p -- "$1/.cache" && chown "$CACHE_OWNER" "$1/.cache" && chmod 0700 "$1/.cache"
+}
+
+fix_cache_owner() {
+    local sub cur
+    for sub in "${BIND_MOUNTED_USER_CACHE[@]}"; do
+        [ -d "$1/$sub" ] || continue
+        cur=$(stat -c '%u:%g' -- "$1/$sub" 2>/dev/null)
+        [ "$cur" = "$CACHE_OWNER" ] || chown -R "$CACHE_OWNER" "$1/$sub"
+    done
+}
+
+mount_user_caches() {
+    local i cache
+    load_human_homes
+    for i in "${!HOME_DIRS[@]}"; do
+        cache="${HOME_DIRS[i]}/.cache"
+        prepare_cache_dir "${HOME_DIRS[i]}" || continue
+        if mountpoint -q -- "$cache"; then
+            log "$cache is already a mountpoint, skipping"
+            continue
+        fi
+        migrate_to_persist "$cache" "${BIND_MOUNTED_USER_CACHE[@]}"
+        if ! mount_tmpfs "$cache" "$USER_CACHE_SIZE" 0700 "uid=${CACHE_OWNER%:*},gid=${CACHE_OWNER#*:}"; then
+            log "ERROR: tmpfs for ${HOME_USERS[i]}'s cache failed, leaving $cache on disk"
+            continue
+        fi
+        bind_persist_dirs "$cache" "${BIND_MOUNTED_USER_CACHE[@]}"
+        fix_cache_owner "$cache"
     done
 }
 
 bind_user_cache_persist_dirs() {
-    [ "${#BIND_MOUNTED_USER_CACHE[@]}" -eq 0 ] && return 0
-    local users
-    users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }')
-    while IFS=: read -r username homedir; do
-        if [ -z "$username" ] || [ -z "$homedir" ]; then continue; fi
-        [ -d "$homedir" ] || continue
-        local cache_dir="$homedir/.cache"
-        local user_stat
-        user_stat=$(stat -c "%u:%g" "$homedir" 2>/dev/null) || continue
-        local uid=${user_stat%:*}
-        local gid=${user_stat#*:}
-
-        if [ ! -d "$cache_dir" ]; then
-            mkdir -p "$cache_dir"
-            chown "${uid}:${gid}" "$cache_dir"
-            chmod 0700 "$cache_dir"
-        fi
-
-        # A tmpfs already over the whole of ~/.cache means mount_user_caches
-        # ran this cycle and already bound these directories inside it.
-        if mountpoint -q -- "$cache_dir"; then
-            continue
-        fi
-
-        migrate_to_persist "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
-        bind_persist_dirs "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
-
-        local subdir
-        for subdir in "${BIND_MOUNTED_USER_CACHE[@]}"; do
-            local d="$cache_dir/$subdir"
-            if [ -d "$d" ]; then
-                local cur_owner
-                cur_owner=$(stat -c "%u:%g" "$d" 2>/dev/null) || cur_owner=""
-                if [ "$cur_owner" != "${uid}:${gid}" ]; then
-                    chown -R "${uid}:${gid}" "$d" || true
-                fi
-            fi
-        done
-    done <<< "$users"
+    local i cache
+    [ ${#BIND_MOUNTED_USER_CACHE[@]} -gt 0 ] || return 0
+    load_human_homes
+    for i in "${!HOME_DIRS[@]}"; do
+        cache="${HOME_DIRS[i]}/.cache"
+        prepare_cache_dir "${HOME_DIRS[i]}" || continue
+        mountpoint -q -- "$cache" && continue
+        migrate_to_persist "$cache" "${BIND_MOUNTED_USER_CACHE[@]}"
+        bind_persist_dirs "$cache" "${BIND_MOUNTED_USER_CACHE[@]}"
+        fix_cache_owner "$cache"
+    done
 }
 
-mount_user_caches() {
-    local users
-    users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $1 ":" $6 }')
-    while IFS=: read -r username homedir; do
-        if [ -z "$username" ] || [ -z "$homedir" ]; then continue; fi
-        [ -d "$homedir" ] || continue
-        local cache_dir="$homedir/.cache"
-        local user_stat
-        user_stat=$(stat -c "%u:%g" "$homedir" 2>/dev/null) || continue
-        local uid=${user_stat%:*}
-        local gid=${user_stat#*:}
-
-        if [ ! -d "$cache_dir" ]; then
-            mkdir -p "$cache_dir"
-            chown "${uid}:${gid}" "$cache_dir"
-            chmod 0700 "$cache_dir"
-        fi
-
-        if mountpoint -q -- "$cache_dir"; then
-            log "$cache_dir already mounted, skipping."
-            continue
-        fi
-
-        migrate_to_persist "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
-
-        log "Mounting tmpfs on $cache_dir (size=$USER_CACHE_SIZE) for $username..."
-        if ! mount -t tmpfs -o "size=${USER_CACHE_SIZE},mode=0700,uid=${uid},gid=${gid},noswap" none "$cache_dir" 2>/dev/null; then
-            if ! mount -t tmpfs -o "size=${USER_CACHE_SIZE},mode=0700,uid=${uid},gid=${gid}" none "$cache_dir"; then
-                log "ERROR: Failed to mount tmpfs cache for $username - leaving ~/.cache on disk"
-                continue
-            fi
-        fi
-
-        bind_persist_dirs "$cache_dir" "${BIND_MOUNTED_USER_CACHE[@]}"
-
-        chown "${uid}:${gid}" "$cache_dir" || true
-        local subdir
-        for subdir in "${BIND_MOUNTED_USER_CACHE[@]}"; do
-            local d="$cache_dir/$subdir"
-            if [ -d "$d" ]; then
-                local cur_owner
-                cur_owner=$(stat -c "%u:%g" "$d" 2>/dev/null) || cur_owner=""
-                if [ "$cur_owner" != "${uid}:${gid}" ]; then
-                    chown -R "${uid}:${gid}" "$d" || true
-                fi
-            fi
-        done
-    done <<< "$users"
-}
-
-umount_try() {
-    local dir="$1"
-    [ ! -d "$dir" ] && return 0
-    if ! mountpoint -q -- "$dir"; then return 0; fi
-
-    log "Attempting normal umount $dir..."
-    if umount "$dir" 2>/dev/null; then log "Unmounted $dir (normal)"; return 0; fi
-    log "Normal umount failed; trying force..."
-    if umount -f "$dir" 2>/dev/null; then log "Unmounted $dir (force)"; return 0; fi
-    log "Force umount failed; trying lazy..."
-    if umount -l "$dir" 2>/dev/null; then log "Unmounted $dir (lazy)"; return 0; fi
-    log "All umount attempts failed for $dir."
+x_server_running() {
+    local f pid
+    for f in /tmp/.X*-lock; do
+        { read -r pid < "$f"; } 2>/dev/null || continue
+        [[ $pid =~ ^[0-9]+$ ]] && [ -d "/proc/$pid" ] && return 0
+    done
     return 1
 }
 
-umount_user_caches() {
-    local users
-    users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $6 }')
-    while read -r homedir; do
-        if [ -z "$homedir" ] || [ ! -d "$homedir" ]; then continue; fi
-        local cache_dir="$homedir/.cache"
-        for ((i=${#BIND_MOUNTED_USER_CACHE[@]}-1; i>=0; i--)); do
-            umount_try "$cache_dir/${BIND_MOUNTED_USER_CACHE[i]}" || true
-        done
-        umount_try "$cache_dir" || true
-    done <<< "$users"
-}
+start_tmpfs_mounts() {
+    local skip_live=0 skip_tmp=0 d kd
+    local -a vc_dirs=()
+    local -A keep_meta=()
+    mkdir -p -- "$PERSIST_ROOT"
 
-umount_var_cache() {
-    for ((i=${#BIND_MOUNTED_VAR_CACHE[@]}-1; i>=0; i--)); do
-        umount_try "/var/cache/${BIND_MOUNTED_VAR_CACHE[i]}" || true
-    done
-    umount_try /var/cache || true
-}
-
-cleanup_stale_files() {
-    local var_cache_excludes=()
-    local vcdir
-    for vcdir in "${BIND_MOUNTED_VAR_CACHE[@]}"; do
-        var_cache_excludes+=("/var/cache/$vcdir")
-    done
-
-    local candidates=()
-
-    local dir
-    for dir in /tmp /var/tmp; do
-        [ -d "$dir" ] || continue
-        while IFS= read -r -d '' file; do
-            candidates+=("$file")
-        done < <($FIND "$dir" -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
-    done
-
-    if [ -d /var/cache ]; then
-        while IFS= read -r -d '' file; do
-            local excluded=0
-            local ex
-            for ex in "${var_cache_excludes[@]}"; do
-                if [[ "$file" == "$ex"* ]]; then
-                    excluded=1
-                    break
-                fi
-            done
-            [ $excluded -eq 0 ] && candidates+=("$file")
-        done < <($FIND /var/cache -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
+    if [ "$LATE_START_SKIP_TMPFS" -eq 1 ] && [ "$START_TRIGGER" = human ]; then
+        skip_live=1
+        skip_tmp=1
+        log "A user session is already running: leaving /tmp and ~/.cache on disk until the next cycle (persisted ~/.cache subdirectories are still bind-mounted)"
+    elif [ "$SKIP_TMP_WITH_LIVE_X" -eq 1 ] && x_server_running; then
+        skip_tmp=1
+        log "An X server has its socket and lock file in /tmp: leaving /tmp on disk (mount /tmp from fstab to have it in RAM from boot)"
     fi
 
-    local users
-    users=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 && $6 ~ /^\/home\// { print $6 }')
-    while read -r homedir; do
-        if [ -z "$homedir" ] || [ ! -d "$homedir" ]; then continue; fi
-        local cache_dir="$homedir/.cache"
-        [ -d "$cache_dir" ] || continue
+    if [ "$skip_tmp" -eq 0 ]; then
+        mount_tmpfs /tmp "$TMP_SIZE" 1777 || log "WARNING: /tmp stays on disk"
+    fi
+    mount_tmpfs /var/tmp "$VAR_TMP_SIZE" 1777 || log "WARNING: /var/tmp stays on disk"
 
-        while IFS= read -r -d '' file; do
-            local skip=0
-            local bd
-            for bd in "${BIND_MOUNTED_USER_CACHE[@]}"; do
-                if [[ "$file" == "$cache_dir/$bd"* ]]; then
-                    skip=1
-                    break
-                fi
-            done
-            [ $skip -eq 0 ] && candidates+=("$file")
-        done < <($FIND "$cache_dir" -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
-    done <<< "$users"
-
-    [ ${#candidates[@]} -eq 0 ] && return 0
-
-    build_inuse_index
-
-    local files_to_delete=()
-    local file
-    for file in "${candidates[@]}"; do
-        if is_file_in_use "$file"; then
-            log "Skipping in-use file: $file"
-        else
-            files_to_delete+=("$file")
+    for d in "${BIND_MOUNTED_VAR_CACHE[@]}"; do
+        if [ -d "/var/cache/$d" ] || [ -d "$PERSIST_ROOT/var/cache/$d" ]; then
+            vc_dirs+=("$d")
         fi
     done
-
-    if [ ${#files_to_delete[@]} -gt 0 ]; then
-        log "Deleting ${#files_to_delete[@]} stale files..."
-        printf '%s\0' "${files_to_delete[@]}" | xargs -0 -r rm -f -- 2>/dev/null || true
-        log "Cleanup complete"
-    fi
-}
-
-MEM_WARN_PERCENT=10
-
-check_memory_pressure() {
-    local avail_kb total_kb
-    avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)
-    total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
-    [ -n "$avail_kb" ] && [ -n "$total_kb" ] && [ "$total_kb" -gt 0 ] || return 0
-
-    local avail_percent=$((avail_kb * 100 / total_kb))
-    if [ "$avail_percent" -lt "$MEM_WARN_PERCENT" ]; then
-        log "WARNING: low memory (${avail_percent}% available). tmpfs mounts (OVERLAY_BASE=$OVERLAY_BASE_SIZE, /tmp=$TMP_SIZE, /var/tmp=$VAR_TMP_SIZE, /var/cache=$VAR_CACHE_SIZE, user caches=$USER_CACHE_SIZE each) count as real RAM usage and can't be reclaimed the way page cache can -- if this persists, the OOM killer may start killing processes, which can include Xorg or the compositor."
-    fi
-}
-
-start_inotify_watcher() {
-    if ! command -v inotifywait >/dev/null 2>&1; then
-        log "inotifywait not available - incremental sync disabled, using full rsync"
-        return 0
-    fi
-
-    local watch_dirs=()
-    local dir
-    for dir in "${OVERLAY_DIRS[@]}"; do
-        local upper="$OVERLAY_BASE/upper${dir}"
-        mkdir -p "$upper"
-        watch_dirs+=("$upper")
-    done
-
-    [ ${#watch_dirs[@]} -eq 0 ] && return 0
-
-    : > "$INOTIFY_QUEUE"
-
-    $INOTIFYWAIT -m -r \
-        -e modify,create,delete,moved_to,moved_from \
-        --format '%w%f' \
-        "${watch_dirs[@]}" >> "$INOTIFY_QUEUE" 2>/dev/null &
-
-    echo $! > "$INOTIFY_PIDFILE"
-    log "inotify watcher started (PID: $!) tracking ${#watch_dirs[@]} upper dir(s)"
-}
-
-stop_inotify_watcher() {
-    if [ -f "$INOTIFY_PIDFILE" ]; then
-        local pid
-        pid=$(cat "$INOTIFY_PIDFILE")
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-        rm -f "$INOTIFY_PIDFILE"
-        log "inotify watcher stopped"
-    fi
-}
-
-start_eager_inotify_watcher() {
-    [ ${#EAGER_SYNC_DIRS[@]} -eq 0 ] && return 0
-    if ! command -v inotifywait >/dev/null 2>&1; then
-        return 0
-    fi
-
-    local watch_dirs=()
-    local dir
-    for dir in "${EAGER_SYNC_DIRS[@]}"; do
-        local upper="$OVERLAY_BASE/upper${dir}"
-        mkdir -p "$upper"
-        watch_dirs+=("$upper")
-    done
-
-    : > "$EAGER_INOTIFY_QUEUE"
-
-    $INOTIFYWAIT -m -r \
-        -e modify,create,delete,moved_to,moved_from \
-        --format '%w%f' \
-        "${watch_dirs[@]}" >> "$EAGER_INOTIFY_QUEUE" 2>/dev/null &
-
-    echo $! > "$EAGER_INOTIFY_PIDFILE"
-    log "Eager inotify watcher started (PID: $!) tracking ${EAGER_SYNC_DIRS[*]}"
-}
-
-stop_eager_inotify_watcher() {
-    if [ -f "$EAGER_INOTIFY_PIDFILE" ]; then
-        local pid
-        pid=$(cat "$EAGER_INOTIFY_PIDFILE")
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-        rm -f "$EAGER_INOTIFY_PIDFILE"
-        log "Eager inotify watcher stopped"
-    fi
-}
-
-start_tmpfs_mounts() {
-    log "Starting tmpfs mounts..."
-
-    mkdir -p "$PERSIST_ROOT"
-
-    migrate_to_persist /var/cache "${BIND_MOUNTED_VAR_CACHE[@]}"
-
-    local skip_live=0
-    if [ "$LATE_START_SKIP_TMPFS" -eq 1 ] && [ "${START_TRIGGER:-}" = "human" ]; then
-        skip_live=1
-        log "A user session is already running: leaving /tmp and ~/.cache on disk until the next cycle (persisted ~/.cache subdirectories are still bind-mounted)"
-    fi
-
-    if [ "$skip_live" -eq 0 ]; then
-        mount_tmpfs /tmp "$TMP_SIZE" 1777 || log "WARNING: /tmp will remain on disk"
-    fi
-    mount_tmpfs /var/tmp "$VAR_TMP_SIZE" 1777 || log "WARNING: /var/tmp will remain on disk"
-    # tmpfs over /var/cache hides directories that packages created on disk
-    # (LightDM's default cache-directory is /var/cache/lightdm). Remember the
-    # owner/mode of the ones listed in KEEP_VAR_CACHE_DIRS and recreate them.
-    local -A keep_meta=()
-    local kd
+    migrate_to_persist /var/cache "${vc_dirs[@]}"
     for kd in "${KEEP_VAR_CACHE_DIRS[@]}"; do
-        [ -d "/var/cache/$kd" ] && keep_meta["$kd"]=$(stat -c '%u:%g %a' "/var/cache/$kd" 2>/dev/null)
+        [ -d "/var/cache/$kd" ] && keep_meta[$kd]=$(stat -c '%u:%g %a' -- "/var/cache/$kd" 2>/dev/null)
     done
-
-    mount_tmpfs /var/cache "$VAR_CACHE_SIZE" 0755 || log "WARNING: /var/cache will remain on disk"
-
-    if mountpoint -q -- /var/cache; then
+    if mount_tmpfs /var/cache "$VAR_CACHE_SIZE" 0755; then
         for kd in "${!keep_meta[@]}"; do
             [ -d "/var/cache/$kd" ] && continue
-            if mkdir -p "/var/cache/$kd" \
+            if mkdir -p -- "/var/cache/$kd" \
                 && chown "${keep_meta[$kd]%% *}" "/var/cache/$kd" \
                 && chmod "${keep_meta[$kd]##* }" "/var/cache/$kd"; then
                 log "Recreated /var/cache/$kd on tmpfs (owner/mode ${keep_meta[$kd]})"
@@ -589,75 +403,349 @@ start_tmpfs_mounts() {
                 log "WARNING: could not recreate /var/cache/$kd"
             fi
         done
+    else
+        log "WARNING: /var/cache stays on disk"
     fi
+    bind_persist_dirs /var/cache "${vc_dirs[@]}"
 
-    bind_persist_dirs /var/cache "${BIND_MOUNTED_VAR_CACHE[@]}"
     if [ "$skip_live" -eq 0 ]; then
         mount_user_caches
     else
         bind_user_cache_persist_dirs
     fi
-
-    log "tmpfs mounts completed."
 }
 
-stop_tmpfs_mounts() {
-    log "Stopping tmpfs mounts..."
-    log "Syncing filesystem..."
-    sync
-
-    umount_user_caches
-    umount_var_cache
-    umount_try /var/tmp || true
-    umount_try /tmp || true
-
-    log "tmpfs mounts stopped."
+build_inuse_index() {
+    local line target
+    local -a fds
+    INUSE_SET=()
+    if [ "$USE_LSOF" -eq 1 ]; then
+        while IFS= read -r line; do
+            [ "${line:0:1}" = n ] && INUSE_SET["${line:1}"]=1
+        done < <(lsof -Fn 2>/dev/null)
+        return 0
+    fi
+    [ "$USE_FUSER" -eq 1 ] && return 0
+    fds=(/proc/[0-9]*/fd/*)
+    [ ${#fds[@]} -gt 0 ] || return 0
+    while IFS= read -r target; do
+        [ -n "$target" ] && INUSE_SET["$target"]=1
+    done < <(readlink -f -- "${fds[@]}" 2>/dev/null)
 }
 
-create_overlay_base() {
-    log "Creating RAM overlay base directory..."
-
-    mkdir -p "$OVERLAY_BASE"
-
-    mkdir -p "$LOWER_ROOT"
-    chmod 0700 "$LOWER_ROOT" 2>/dev/null || true
-
-    if mountpoint -q "$OVERLAY_BASE"; then
-        return 0
+is_file_in_use() {
+    local real
+    [ -e "$1" ] || return 1
+    if [ "$USE_FUSER" -eq 1 ] && [ "$USE_LSOF" -ne 1 ]; then
+        fuser -s -- "$1" >/dev/null 2>&1
+        return
     fi
+    real=$(readlink -f -- "$1" 2>/dev/null) || real=$1
+    [ -n "${INUSE_SET[$real]+x}" ]
+}
 
-    if mount -t tmpfs -o "size=${OVERLAY_BASE_SIZE},mode=0755,noswap" tmpfs "$OVERLAY_BASE" 2>/dev/null; then
-        log "Mounted tmpfs at $OVERLAY_BASE (size=$OVERLAY_BASE_SIZE of RAM)"
-        return 0
+cleanup_stale_files() {
+    local -a roots=() candidates=() doomed=()
+    local d f
+    load_mount_table
+    for d in /tmp /var/tmp /var/cache; do
+        [ "${MT_FSTYPE[$d]:-}" = tmpfs ] && roots+=("$d")
+    done
+    load_human_homes
+    for d in "${HOME_DIRS[@]}"; do
+        [ "${MT_FSTYPE[$d/.cache]:-}" = tmpfs ] && roots+=("$d/.cache")
+    done
+    [ ${#roots[@]} -gt 0 ] || return 0
+
+    while IFS= read -r -d '' f; do
+        candidates+=("$f")
+    done < <("${FIND[@]}" "${roots[@]}" -xdev -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
+    [ ${#candidates[@]} -gt 0 ] || return 0
+
+    build_inuse_index
+    for f in "${candidates[@]}"; do
+        is_file_in_use "$f" || doomed+=("$f")
+    done
+    [ ${#doomed[@]} -gt 0 ] || return 0
+    printf '%s\0' "${doomed[@]}" | xargs -0 -r rm -f --
+    log "Deleted ${#doomed[@]} unopened file(s) older than ${STALE_MINUTES}m from tmpfs"
+}
+
+check_memory_pressure() {
+    local key val _ avail=0 total=0 pct
+    while read -r key val _; do
+        case $key in
+            MemTotal:) total=$val ;;
+            MemAvailable:) avail=$val ;;
+        esac
+    done < /proc/meminfo
+    [ "$total" -gt 0 ] || return 0
+    pct=$((avail * 100 / total))
+    if [ "$pct" -lt "$MEM_WARN_PERCENT" ]; then
+        [ "$MEM_LOW" -eq 1 ] || log "WARNING: low memory (${pct}% available). tmpfs and overlay contents are not reclaimable like page cache; the OOM killer may pick Xorg or the compositor."
+        MEM_LOW=1
+    elif [ "$MEM_LOW" -eq 1 ]; then
+        MEM_LOW=0
+        log "Memory recovered (${pct}% available)"
     fi
+}
 
-    if mount -t tmpfs -o "size=${OVERLAY_BASE_SIZE},mode=0755" tmpfs "$OVERLAY_BASE"; then
-        log "Mounted tmpfs at $OVERLAY_BASE (size=$OVERLAY_BASE_SIZE of RAM, noswap unsupported on this kernel)"
-        return 0
-    fi
+start_watcher() {
+    local id=${1//\//_}
+    printf 'x\n' >> "$RUN_DIR/dirty$id"
+    [ "$HAVE_INOTIFY" -eq 1 ] || return 0
+    "${INOTIFYWAIT[@]}" -m -r -q -e modify,attrib,create,delete,move --format x \
+        "$OVERLAY_BASE/upper$1" >> "$RUN_DIR/dirty$id" 2>/dev/null 9>&- &
+    printf '%s\n' "$!" > "$RUN_DIR/watch$id.pid"
+}
 
-    log "ERROR: Failed to mount tmpfs at $OVERLAY_BASE"
+watcher_pid() {
+    local pidf="$RUN_DIR/watch${1//\//_}.pid" pid comm
+    REPLY=""
+    [ -s "$pidf" ] || return 1
+    read -r pid < "$pidf" || return 1
+    { read -r comm < "/proc/$pid/comm"; } 2>/dev/null || return 1
+    [ "$comm" = inotifywait ] || return 1
+    REPLY=$pid
+}
+
+stop_watchers() {
+    local pidf pid comm
+    for pidf in "$RUN_DIR"/watch*.pid; do
+        if read -r pid < "$pidf" && { read -r comm < "/proc/$pid/comm"; } 2>/dev/null && [ "$comm" = inotifywait ]; then
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+        fi
+        rm -f -- "$pidf"
+    done
+}
+
+ensure_watchers() {
+    local dir
+    [ "$HAVE_INOTIFY" -eq 1 ] || return 0
+    for dir in "${ACTIVE[@]}"; do
+        watcher_pid "$dir" && continue
+        log "inotify watcher for $dir is not running, restarting it"
+        start_watcher "$dir"
+    done
+}
+
+take_dirty() {
+    local flag="$RUN_DIR/dirty${1//\//_}"
+    watcher_pid "$1" || return 0
+    [ -s "$flag" ] || return 1
+    : > "$flag"
+}
+
+dir_excluded() {
+    local e
+    for e in "${EXCLUDED_FROM_SYNC[@]}" "${EXCLUDED_FROM_OVERLAY[@]}"; do
+        if [ "$e" = "$1" ] || [[ $1 == "$e"/* ]]; then
+            return 0
+        fi
+    done
     return 1
 }
 
-INIT_PROTECT_ACTIVE=0
-SUPERVISOR_FROZEN=""
+collect_skips() {
+    local e rel
+    SKIPS=()
+    SKIP_SET=()
+    for e in "${EXCLUDED_FROM_SYNC[@]}" "${EXCLUDED_FROM_OVERLAY[@]}"; do
+        [[ $e == "$1"/* ]] || continue
+        rel=${e#"$1"/}
+        rel=${rel%/}
+        SKIPS+=("$rel")
+        SKIP_SET[$rel]=1
+    done
+}
 
-# Called once per overlay start: if runit is supervising and /etc gets overlaid,
-# add the supervision directories to the exclusion list.
+rel_skipped() {
+    local p=$1
+    while :; do
+        [ -n "${SKIP_SET[$p]+x}" ] && return 0
+        [[ $p == */* ]] || return 1
+        p=${p%/*}
+    done
+}
+
+lower_parent_safe() {
+    local real
+    [[ $2 == */* ]] || return 0
+    real=$(realpath -e -- "$1/${2%/*}" 2>/dev/null) || return 1
+    [ "$real" = "$LOWER_REAL/${2%/*}" ]
+}
+
+present_in_upper() {
+    { [ -e "$1" ] || [ -L "$1" ]; } && [ ! -c "$1" ]
+}
+
+scan_devices() {
+    local maj min type path
+    WHITEOUTS=()
+    DEVICES=()
+    while IFS=: read -r maj min type path; do
+        path=${path#"$1"/}
+        if [ "$maj:$min" = 0:0 ] && [ "$type" = "character special file" ]; then
+            WHITEOUTS+=("$path")
+        else
+            DEVICES+=("$path")
+        fi
+    done < <("${FIND[@]}" "$1" \( -type c -o -type b \) -exec stat -c '%t:%T:%F:%n' -- {} + 2>/dev/null)
+}
+
+remove_from_disk() {
+    if rm -rf --one-file-system -- "$1"; then
+        PRUNED=$((PRUNED + 1))
+        log "Removed $2 from disk (deleted in RAM)"
+    else
+        log "ERROR: could not remove $1"
+    fi
+}
+
+prune_hidden() {
+    local dir=$1 upper=$2 lower=$3
+    local -A bad=() mnt=()
+    local mp rel key parent L M U entry name
+    load_mount_table
+    for mp in "${!MT_FSTYPE[@]}"; do
+        [[ $mp == "$dir"/* ]] && mnt[${mp#"$dir"/}]=1
+    done
+    while IFS= read -r -d '' rel; do
+        key=${rel:-.}
+        if [ -n "$rel" ]; then
+            parent=.
+            [[ $rel == */* ]] && parent=${rel%/*}
+            if [ -n "${bad[$parent]+x}" ] || [ -n "${SKIP_SET[$rel]+x}" ] || [ -n "${mnt[$rel]+x}" ]; then
+                bad[$key]=1
+                continue
+            fi
+        fi
+        L=$lower${rel:+/$rel}
+        M=$dir${rel:+/$rel}
+        U=$upper${rel:+/$rel}
+        if [ -L "$L" ] || [ ! -d "$L" ] || [ -L "$M" ] || [ ! -d "$M" ]; then
+            bad[$key]=1
+            continue
+        fi
+        for entry in "$L"/* "$L"/.[!.]* "$L"/..?*; do
+            name=${entry##*/}
+            [ -n "${SKIP_SET[${rel:+$rel/}$name]+x}" ] && continue
+            [ -n "${mnt[${rel:+$rel/}$name]+x}" ] && continue
+            present_in_upper "$U/$name" && continue
+            if [ -e "$M/$name" ] || [ -L "$M/$name" ]; then
+                continue
+            fi
+            present_in_upper "$U/$name" && continue
+            remove_from_disk "$entry" "$M/$name"
+        done
+    done < <("${FIND[@]}" "$upper" -type d -printf '%P\0' 2>/dev/null)
+}
+
+prune_whiteouts() {
+    local lower=$1 dir=$2 rel
+    for rel in "${WHITEOUTS[@]}"; do
+        [ -n "$rel" ] || continue
+        rel_skipped "$rel" && continue
+        lower_parent_safe "$lower" "$rel" || continue
+        if [ -e "$lower/$rel" ] || [ -L "$lower/$rel" ]; then
+            remove_from_disk "$lower/$rel" "$dir/$rel"
+        fi
+    done
+}
+
+copy_devices() {
+    local upper=$1 lower=$2 rel
+    for rel in "${DEVICES[@]}"; do
+        [ -n "$rel" ] || continue
+        rel_skipped "$rel" && continue
+        lower_parent_safe "$lower" "$rel" || continue
+        rm -rf --one-file-system -- "$lower/${rel:?}" 2>/dev/null
+        cp -a -- "$upper/$rel" "$lower/$rel" || log "ERROR: could not copy device node $rel to disk"
+    done
+}
+
+sync_dir() {
+    local dir=$1 mode=${2:-live}
+    local upper="$OVERLAY_BASE/upper$dir" lower="$LOWER_ROOT$dir"
+    local -a excl=() lines=()
+    local rel out rc line n=0
+    [ -d "$upper" ] || return 0
+    dir_excluded "$dir" && return 0
+    if ! mountpoint -q -- "$lower"; then
+        log "ERROR: $lower is not mounted, cannot sync $dir"
+        return 1
+    fi
+    LOWER_REAL=$(realpath -e -- "$lower") || return 1
+    collect_skips "$dir"
+    for rel in "${SKIPS[@]}"; do
+        rsync_literal "/$rel"
+        excl+=("--exclude=$REPLY")
+    done
+
+    PRUNED=0
+    scan_devices "$upper"
+    if [ "$mode" = live ] && is_our_overlay "$dir"; then
+        prune_hidden "$dir" "$upper" "$lower"
+    else
+        prune_whiteouts "$lower" "$dir"
+    fi
+
+    out=$("${RSYNC[@]}" -aAXH --numeric-ids --force --no-devices --filter='-x trusted.overlay.*' \
+        "${excl[@]}" --out-format='%n' -- "$upper/" "$lower/" 2>&1)
+    rc=$?
+    [ ${#DEVICES[@]} -gt 0 ] && copy_devices "$upper" "$lower"
+    sync -f -- "$lower" 2>/dev/null || sync
+
+    [ -n "$out" ] && mapfile -t lines <<< "$out"
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 24 ]; then
+        log "ERROR: rsync failed for $dir (exit $rc)"
+        for line in "${lines[@]}"; do
+            [[ $line == rsync* ]] && log "  $line"
+        done
+        return 1
+    fi
+    for line in "${lines[@]}"; do
+        case $line in
+            ''|rsync*|'file has vanished'*) ;;
+            *) n=$((n + 1)) ;;
+        esac
+    done
+    log "Synced $dir: $n item(s) written, $PRUNED removed"
+}
+
+sync_overlays() {
+    local want=$1 dir rc=0
+    shift
+    {
+        if ! flock -w "$SYNC_LOCK_TIMEOUT" 7; then
+            log "ERROR: sync lock held for ${SYNC_LOCK_TIMEOUT}s, skipping this sync"
+            return 1
+        fi
+        for dir in "$@"; do
+            in_active "$dir" || continue
+            if [ "$want" = dirty ] && ! take_dirty "$dir"; then
+                continue
+            fi
+            sync_dir "$dir" live || rc=1
+        done
+    } 7> "$SYNC_LOCK" || rc=1
+    return "$rc"
+}
+
 protect_init_dirs() {
+    local o d e known has_etc=0
+    local -a added=()
     INIT_PROTECT_ACTIVE=0
     pgrep -x runsvdir >/dev/null 2>&1 || return 0
-
-    local o d e known has_etc=0 added=()
     for o in "${OVERLAY_DIRS[@]}"; do
-        [ "$o" = "/etc" ] && has_etc=1
+        [ "$o" = /etc ] && has_etc=1
     done
     [ "$has_etc" -eq 1 ] || return 0
-
     for d in "${INIT_PROTECT_DIRS[@]}"; do
-        # a symlink (e.g. /etc/service -> /run/...) points outside /etc: nothing to protect
-        { [ -d "$d" ] && [ ! -L "$d" ]; } || continue
+        if [ ! -d "$d" ] || [ -L "$d" ]; then
+            continue
+        fi
         known=0
         for e in "${EXCLUDED_FROM_OVERLAY[@]}"; do
             [ "$e" = "$d" ] && known=1
@@ -665,379 +753,269 @@ protect_init_dirs() {
         [ "$known" -eq 1 ] || EXCLUDED_FROM_OVERLAY+=("$d")
         added+=("$d")
     done
-
-    if [ "${#added[@]}" -gt 0 ]; then
+    if [ ${#added[@]} -gt 0 ]; then
         INIT_PROTECT_ACTIVE=1
-        log "runit (runsvdir) detected: keeping ${added[*]} on disk and pausing runsvdir during the /etc swap so services are not restarted"
+        log "runit (runsvdir) detected: keeping ${added[*]} on disk and pausing runsvdir while /etc is swapped"
     fi
 }
 
-# Pause runsvdir while /etc (or something below it) is mounted/unmounted, so it
-# cannot rescan in the millisecond window between the overlay mount and the bind
-# that restores the excluded directories.
 freeze_supervisors() {
+    local -a pids=()
     [ "$INIT_PROTECT_ACTIVE" -eq 1 ] || return 0
-    case "$1" in /etc|/etc/*) ;; *) return 0 ;; esac
-    local pids
-    pids=$(pgrep -x runsvdir 2>/dev/null | tr '\n' ' ')
-    [ -n "$pids" ] || return 0
-    # dead-man's switch: resume them after 3s even if this script dies mid-swap
-    ( sleep 3; kill -CONT $pids 2>/dev/null ) >/dev/null 2>&1 &
-    if kill -STOP $pids 2>/dev/null; then
-        SUPERVISOR_FROZEN="$pids"
-    fi
+    [ ${#SUPERVISOR_FROZEN[@]} -eq 0 ] || return 0
+    case $1 in
+        /etc|/etc/*) ;;
+        *) return 0 ;;
+    esac
+    mapfile -t pids < <(pgrep -x runsvdir 2>/dev/null)
+    [ ${#pids[@]} -gt 0 ] || return 0
+    ( sleep 3; kill -CONT "${pids[@]}" 2>/dev/null ) >/dev/null 2>&1 9>&- &
+    DEADMAN_PID=$!
+    kill -STOP "${pids[@]}" 2>/dev/null && SUPERVISOR_FROZEN=("${pids[@]}")
 }
 
 thaw_supervisors() {
-    [ -n "$SUPERVISOR_FROZEN" ] || return 0
-    kill -CONT $SUPERVISOR_FROZEN 2>/dev/null
-    SUPERVISOR_FROZEN=""
+    if [ ${#SUPERVISOR_FROZEN[@]} -gt 0 ]; then
+        kill -CONT "${SUPERVISOR_FROZEN[@]}" 2>/dev/null
+        SUPERVISOR_FROZEN=()
+    fi
+    if [ -n "$DEADMAN_PID" ]; then
+        kill "$DEADMAN_PID" 2>/dev/null
+        wait "$DEADMAN_PID" 2>/dev/null
+        DEADMAN_PID=""
+    fi
 }
 
-create_directory_overlay() {
-    local target_dir="$1"
-    local prepopulate="${2:-1}"
-    local dir_name upper_dir work_dir lower_dir
-    dir_name=$(echo "$target_dir" | tr '/' '_')
-    upper_dir="$OVERLAY_BASE/upper${target_dir}"
-    work_dir="$OVERLAY_BASE/work${target_dir}"
-    lower_dir="$LOWER_ROOT${target_dir}"
-
-    mkdir -p "$upper_dir" "$work_dir" "$lower_dir"
-
-    if ! mountpoint -q -- "$lower_dir"; then
-        if ! mount --bind "$target_dir" "$lower_dir"; then
-            log "ERROR: Failed to bind-mount $target_dir -> $lower_dir"
-            return 1
+apply_overlay_excludes() {
+    local dir=$1 e
+    for e in "${EXCLUDED_FROM_OVERLAY[@]}"; do
+        [[ $e == "$dir"/* ]] || continue
+        if [ ! -e "$LOWER_ROOT$e" ]; then
+            log "$e not found, skipping overlay exclusion"
+        elif mountpoint -q -- "$e"; then
+            log "$e is already a mountpoint, skipping overlay exclusion"
+        elif bind_mount "$LOWER_ROOT$e" "$e" exclude "$dir"; then
+            log "Excluded $e from the RAM overlay (bound to disk)"
+        else
+            log "ERROR: failed to exclude $e from the overlay"
         fi
-    fi
+    done
+}
 
-    if [ "$(findmnt -n -o FSTYPE --target "$target_dir" 2>/dev/null)" = "overlay" ]; then
-        log "$target_dir already has overlay mounted, skipping"
+create_overlay_base() {
+    mkdir -p -- "$OVERLAY_BASE" "$LOWER_ROOT" || return 1
+    chmod 0700 "$LOWER_ROOT" 2>/dev/null
+    if mountpoint -q -- "$OVERLAY_BASE"; then
+        log "ERROR: $OVERLAY_BASE is already mounted by something else, refusing to reuse it"
+        return 1
+    fi
+    if mount -t tmpfs -o "size=$OVERLAY_BASE_SIZE,mode=0700,noswap" tmpfs "$OVERLAY_BASE" 2>/dev/null \
+        || mount -t tmpfs -o "size=$OVERLAY_BASE_SIZE,mode=0700" tmpfs "$OVERLAY_BASE"; then
+        track base "$OVERLAY_BASE"
+        log "Mounted tmpfs at $OVERLAY_BASE (size=$OVERLAY_BASE_SIZE)"
         return 0
     fi
+    log "ERROR: failed to mount tmpfs at $OVERLAY_BASE"
+    return 1
+}
 
-    if [ "$prepopulate" -eq 1 ]; then
-        local exclude_opts=()
-        while IFS= read -r opt; do
-            exclude_opts+=("$opt")
-        done < <(compute_exclude_opts "$target_dir")
-
-        chmod --reference="$lower_dir" "$upper_dir"
-        chown --reference="$lower_dir" "$upper_dir"
-
-        log "Pre-populating upper layer for $target_dir (ensures full stat visibility)..."
-        $RSYNC -aAX --ignore-existing "${exclude_opts[@]}" "$lower_dir/" "$upper_dir/" 2>/dev/null || \
-            log "WARNING: Pre-population rsync for $target_dir had errors (non-fatal)"
+mount_overlay_dir() {
+    local dir=$1
+    local upper="$OVERLAY_BASE/upper$dir" work="$OVERLAY_BASE/work$dir" lower="$LOWER_ROOT$dir"
+    local opts="" ok=0
+    if [ "$(findmnt -n -o FSTYPE --target "$dir" 2>/dev/null)" = overlay ]; then
+        log "ERROR: $dir already has an overlay this daemon did not mount, skipping it"
+        return 1
     fi
+    if mountpoint -q -- "$lower"; then
+        log "ERROR: $lower is already mounted but not tracked, skipping $dir"
+        return 1
+    fi
+    mkdir -p -- "$upper" "$work" "$lower" || return 1
+    if ! bind_mount "$dir" "$lower" lower "$dir"; then
+        log "ERROR: failed to bind-mount $dir -> $lower"
+        return 1
+    fi
+    "${RSYNC[@]}" -aAX --numeric-ids --filter='-x trusted.overlay.*' --exclude='/*' -- "$lower/" "$upper/" 2>/dev/null \
+        || log "WARNING: could not copy owner/mode of $dir to its upper layer"
 
-    freeze_supervisors "$target_dir"
-    log "Mounting overlay on $target_dir..."
-
-    local mounted=0
-    if mount -t overlay "overlay_${dir_name}" \
-        -o "lowerdir=${lower_dir},upperdir=${upper_dir},workdir=${work_dir},metacopy=off,noatime" \
-        "$target_dir" 2>/dev/null; then
-        log "Successfully mounted RAM overlay on $target_dir (metacopy=off)"
-        mounted=1
-    else
-        log "WARNING: Mount with metacopy=off failed, retrying without it..."
-        if mount -t overlay "overlay_${dir_name}" \
-            -o "lowerdir=${lower_dir},upperdir=${upper_dir},workdir=${work_dir},noatime" \
-            "$target_dir" 2>/dev/null; then
-            log "Successfully mounted RAM overlay on $target_dir (metacopy not supported on this kernel)"
-            mounted=1
+    freeze_supervisors "$dir"
+    for opts in "${OVERLAY_MOUNT_OPTS[@]}"; do
+        if mount -t overlay "ramoverlay${dir//\//_}" \
+            -o "lowerdir=$lower,upperdir=$upper,workdir=$work${opts:+,$opts},noatime" "$dir" 2>/dev/null; then
+            ok=1
+            break
         fi
-    fi
-
-    if [ "$mounted" -eq 0 ]; then
+    done
+    if [ "$ok" -eq 0 ]; then
         thaw_supervisors
-        log "ERROR: Failed to mount overlay on $target_dir — writes will go directly to disk"
+        umount_path "$lower"
+        log "ERROR: overlay mount on $dir failed, writes go straight to disk"
         return 1
     fi
-
-    apply_overlay_excludes "$target_dir"
+    track overlay "$dir" "$dir"
+    apply_overlay_excludes "$dir"
     thaw_supervisors
-    return 0
-}
-
-start_overlay() {
-    if is_active; then
-        log "RAM overlay is already active"
-        return 0
-    fi
-
-    log "Starting unified RAM overlay system..."
-
-    protect_init_dirs
-    start_tmpfs_mounts
-
-    if ! create_overlay_base; then
-        log "ERROR: Cannot create RAM overlay base - aborting overlay start (will retry on next login cycle)"
-        return 1
-    fi
-
-    local failed=0
-    local dir
-    local -A overlay_pids=()
-    for dir in "${OVERLAY_DIRS[@]}"; do
-        if [ -d "$dir" ]; then
-            create_directory_overlay "$dir" &
-            overlay_pids["$dir"]=$!
-        else
-            log "WARNING: Directory $dir does not exist, skipping"
-        fi
-    done
-    for dir in "${!overlay_pids[@]}"; do
-        if ! wait "${overlay_pids[$dir]}"; then
-            log "WARNING: Failed to create overlay for $dir"
-            failed=$((failed + 1))
-        fi
-    done
-
-    if [ $failed -gt 0 ]; then
-        log "WARNING: $failed overlay(s) failed to mount — system running in degraded mode"
-        echo "degraded" > "$STATE_FILE"
-        echo "started=$(date +%s)" >> "$STATE_FILE"
-    else
-        echo "active" > "$STATE_FILE"
-        echo "started=$(date +%s)" >> "$STATE_FILE"
-    fi
-
-    start_inotify_watcher
-    start_eager_inotify_watcher
-
-    log "RAM overlay system started successfully"
-    log "Overlaid directories: ${OVERLAY_DIRS[*]}"
-    log "Changes are being stored in RAM at: $OVERLAY_BASE"
-
-    df -h "$OVERLAY_BASE" 2>/dev/null | tail -1 | awk '{print "RAM allocated: " $2 " (Used: " $3 ", Available: " $4 ")"}'
-
-    log "tmpfs cleanup loop starting (interval=${CLEAN_INTERVAL}s, stale>${STALE_MINUTES}m)."
-
-    log "Active overlay mounts:"
-    findmnt -t overlay | tee -a "$LOG_FILE"
-}
-
-sync_changes() {
-    local use_inotify="${1:-}"
-    shift || true
-    local -a dirs=("$@")
-    [ ${#dirs[@]} -eq 0 ] && dirs=("${OVERLAY_DIRS[@]}")
-
-    if ! is_active; then
-        log "RAM overlay is not active, nothing to sync"
-        return 0
-    fi
-
-    log "Syncing changes from RAM to disk (${dirs[*]})..."
-
-    local sync_dir_fail="/var/run/ramoverlay-syncfail"
-    rm -f "${sync_dir_fail}".*
-
-    if [ -z "$use_inotify" ]; then
-        use_inotify=0
-        [ -f "$INOTIFY_PIDFILE" ] && kill -0 "$(cat "$INOTIFY_PIDFILE")" 2>/dev/null && use_inotify=1
-    fi
-
-    local snap="${INOTIFY_QUEUE}.snap"
-    if [ "$use_inotify" -eq 1 ]; then
-        if [ -s "$INOTIFY_QUEUE" ]; then
-            mv "$INOTIFY_QUEUE" "$snap"
-            : > "$INOTIFY_QUEUE"
-        else
-            log "No inotify-tracked changes since last sync, nothing to do"
-            return 0
-        fi
-    fi
-
-    for dir in "${dirs[@]}"; do
-        (
-            local upper_dir="$OVERLAY_BASE/upper${dir}"
-            local lower_dir="$LOWER_ROOT${dir}"
-            local fail_flag="${sync_dir_fail}.${dir//\//_}"
-
-            if [ ! -d "$upper_dir" ] || [ -z "$(ls -A "$upper_dir" 2>/dev/null)" ]; then
-                log "No changes in $dir, skipping"
-                exit 0
-            fi
-
-            local exclude_opts=()
-            while IFS= read -r opt; do
-                exclude_opts+=("$opt")
-            done < <(compute_exclude_opts "$dir")
-
-            if [ "$use_inotify" -eq 1 ]; then
-                local changed_files
-                changed_files=$(grep -F "${upper_dir}/" "$snap" 2>/dev/null \
-                    | sed "s|^${upper_dir}/||" \
-                    | sort -u)
-
-                if [ -z "$changed_files" ]; then
-                    log "No inotify-tracked changes in $dir, skipping"
-                    exit 0
-                fi
-
-                local count
-                count=$(echo "$changed_files" | wc -l)
-                log "Incremental sync of $dir ($count changed file(s) via inotify)..."
-
-                $RSYNC -aAXH "${exclude_opts[@]}" \
-                    --files-from=<(echo "$changed_files") \
-                    "$upper_dir/" "$lower_dir/" 2>&1 | tee -a "$LOG_FILE"
-                local rsync_ok=${PIPESTATUS[0]}
-
-                if [ "$rsync_ok" -ne 0 ]; then
-                    log "ERROR: Incremental rsync failed for $dir (exit $rsync_ok)"
-                    touch "$fail_flag"
-                else
-                    log "Incremental sync of $dir complete"
-                fi
-                exit 0
-            fi
-
-            log "Full sync of $dir (no inotify)..."
-
-            $RSYNC -aAXHv "${exclude_opts[@]}" \
-                "$upper_dir/" "$lower_dir/" 2>&1 | tee -a "$LOG_FILE"
-            local rsync_ok=${PIPESTATUS[0]}
-
-            if [ "$rsync_ok" -eq 0 ]; then
-                log "Successfully synced $dir"
-            else
-                log "ERROR: Failed to sync $dir (rsync exit code: $rsync_ok)"
-                touch "$fail_flag"
-            fi
-        ) &
-    done
-
-    wait
-
-    [ -f "$snap" ] && rm -f "$snap"
-
-    local sync_targets=()
-    for dir in "${dirs[@]}"; do
-        sync_targets+=("$LOWER_ROOT$dir")
-    done
-    sync -f -- "${sync_targets[@]}" 2>/dev/null || sync
-
-    local sync_failed=0
-    for dir in "${dirs[@]}"; do
-        local fail_flag="${sync_dir_fail}.${dir//\//_}"
-        if [ -f "$fail_flag" ]; then
-            sync_failed=$((sync_failed + 1))
-            rm -f "$fail_flag"
-        fi
-    done
-
-    if [ "$sync_failed" -gt 0 ]; then
-        log "WARNING: $sync_failed directory sync(s) failed"
-        return 1
-    else
-        log "All changes synced successfully"
-        return 0
-    fi
+    log "Mounted RAM overlay on $dir (${opts:-kernel default options})"
 }
 
 stop_overlay() {
-    if ! is_active; then
-        log "RAM overlay is not active"
-        stop_tmpfs_mounts
+    local -a kinds=() targets=() owners=()
+    local k t o i r dir rc=0
+    if [ ! -s "$MOUNTS_FILE" ]; then
+        rm -f -- "$MOUNTS_FILE" "$STATE_FILE"
         return 0
     fi
-
     log "Stopping RAM overlay system..."
+    stop_watchers
+    load_active
+    {
+        flock -w "$SYNC_LOCK_TIMEOUT" 7 || log "WARNING: sync lock still held, syncing anyway"
+        for dir in "${ACTIVE[@]}"; do
+            is_our_overlay "$dir" || continue
+            sync_dir "$dir" live || rc=1
+        done
 
-    stop_inotify_watcher
-    stop_eager_inotify_watcher
-
-    # Full sync, not incremental: the inotify queue can miss the last
-    # event when the watcher is killed right before this call.
-    sync_changes 0
-
-    log "Unmounting overlay filesystems..."
-    for ((i=${#OVERLAY_DIRS[@]}-1; i>=0; i--)); do
-        local dir="${OVERLAY_DIRS[i]}"
-        freeze_supervisors "$dir"
-        remove_overlay_excludes "$dir"
-        umount_try "$dir" || log "ERROR: Failed to unmount $dir"
+        while IFS=$'\t' read -r k t o; do
+            kinds+=("$k")
+            targets+=("$t")
+            owners+=("$o")
+        done < "$MOUNTS_FILE"
+        for ((i = ${#kinds[@]} - 1; i >= 0; i--)); do
+            k=${kinds[i]}
+            t=${targets[i]}
+            o=${owners[i]}
+            case $k in
+                exclude)
+                    freeze_supervisors "$o"
+                    umount_path "$t" || rc=1
+                    ;;
+                overlay)
+                    freeze_supervisors "$o"
+                    umount_path "$t"
+                    r=$?
+                    thaw_supervisors
+                    if [ "$r" -eq 2 ]; then
+                        log "Re-syncing $t from RAM after the lazy detach"
+                        sync_dir "$t" detached || rc=1
+                    elif [ "$r" -ne 0 ]; then
+                        rc=1
+                    fi
+                    ;;
+                *)
+                    umount_path "$t"
+                    [ $? -eq 1 ] && rc=1
+                    ;;
+            esac
+        done
         thaw_supervisors
-        umount_try "$LOWER_ROOT$dir" || log "ERROR: Failed to unmount $LOWER_ROOT$dir"
-    done
+    } 7> "$SYNC_LOCK"
 
-    if mountpoint -q "$OVERLAY_BASE"; then
-        log "Unmounting tmpfs and freeing RAM..."
-        umount "$OVERLAY_BASE" || log "Warning: Failed to unmount tmpfs"
-    fi
-
-    rm -f "$STATE_FILE"
-
-    stop_tmpfs_mounts
-
+    rm -f -- "$MOUNTS_FILE" "$STATE_FILE" "$RUN_DIR"/dirty*
+    sync
     log "RAM overlay system stopped - RAM freed"
-
-    local archive="/var/log/ramoverlay.last.log"
-    cp "$LOG_FILE" "$archive" 2>/dev/null || true
-    : > "$LOG_FILE"
+    cp -f -- "$LOG_FILE" "${LOG_FILE%.log}.last.log" 2>/dev/null && : > "$LOG_FILE"
+    return "$rc"
 }
 
-# Prints "<who> <sessions> <x11> <wayland>": one count per login signal.
-#
-# Only human logins count. A display manager's greeter has its own logind
-# session, its own X server socket and a system uid, so counting it would make
-# the daemon believe a user logged in the moment LightDM/SDDM comes up (and,
-# after a logout, the fresh greeter would keep it from ever noticing).
+adopt_existing() {
+    local dir ok=1
+    load_active
+    for dir in "${ACTIVE[@]}"; do
+        is_our_overlay "$dir" || ok=0
+    done
+    if [ ${#ACTIVE[@]} -gt 0 ] && [ "$ok" -eq 1 ] && [ -s "$STATE_FILE" ]; then
+        log "Adopting the overlay left mounted by a previous daemon instance"
+        protect_init_dirs
+        stop_watchers
+        for dir in "${ACTIVE[@]}"; do
+            start_watcher "$dir"
+        done
+        sync_overlays all "${ACTIVE[@]}" || log "WARNING: sync after adoption reported failures"
+        return 0
+    fi
+    log "Mounts left by a previous daemon instance are incomplete, tearing them down first"
+    stop_overlay
+    return 1
+}
+
+start_overlay() {
+    local dir failed=0 state=active
+    if [ -s "$MOUNTS_FILE" ] && adopt_existing; then
+        return 0
+    fi
+    log "Starting unified RAM overlay system..."
+    protect_init_dirs
+    : > "$MOUNTS_FILE"
+    start_tmpfs_mounts
+
+    if [ "$HAVE_RSYNC" -eq 0 ]; then
+        log "ERROR: rsync not found, not overlaying ${OVERLAY_DIRS[*]} because changes could never reach disk"
+        failed=${#OVERLAY_DIRS[@]}
+    elif ! create_overlay_base; then
+        failed=${#OVERLAY_DIRS[@]}
+    else
+        for dir in "${OVERLAY_DIRS[@]}"; do
+            if [ ! -d "$dir" ] || [ -L "$dir" ]; then
+                log "WARNING: $dir is not a directory, skipping"
+                failed=$((failed + 1))
+                continue
+            fi
+            mount_overlay_dir "$dir" || failed=$((failed + 1))
+        done
+    fi
+
+    load_active
+    if [ "$failed" -gt 0 ]; then
+        state=degraded
+        log "WARNING: $failed overlay(s) not mounted, those directories are written straight to disk"
+    fi
+    printf '%s\nstarted=%(%s)T\n' "$state" -1 > "$STATE_FILE"
+    for dir in "${ACTIVE[@]}"; do
+        start_watcher "$dir"
+    done
+    [ ${#ACTIVE[@]} -gt 0 ] && log "RAM overlay active on ${ACTIVE[*]} (RAM limit $OVERLAY_BASE_SIZE at $OVERLAY_BASE)"
+    return 0
+}
+
 login_signal_counts() {
     local who_n=0 sess_n=0 x_n=0 wl_n=0
     local dir f w line cls uid
 
-    # 1. tty/utmp logins: root or a regular user, never a service account.
     who_n=$(who 2>/dev/null | awk -v min="$MIN_HUMAN_UID" '
         BEGIN { while ((getline l < "/etc/passwd") > 0) { split(l, f, ":"); id[f[1]] = f[3] } }
         ($1 in id) && (id[$1] == 0 || id[$1] >= min) && !seen[$1]++ { n++ }
         END { print n + 0 }')
 
-    # 2. elogind session records (class "user" only; greeter/lock-screen and
-    #    background sessions are ignored). Reading the state dir instead of
-    #    running `loginctl` avoids a D-Bus call, and D-Bus activating elogind,
-    #    once a second while the system is still booting.
     for dir in "${SESSION_DIRS[@]}"; do
         [ -d "$dir" ] || continue
         for f in "$dir"/*; do
             [ -f "$f" ] || continue
-            cls="" uid=""
+            cls=""
+            uid=""
             while IFS= read -r line; do
-                case "$line" in
+                case $line in
                     CLASS=*) cls=${line#CLASS=} ;;
-                    UID=*)   uid=${line#UID=} ;;
+                    UID=*) uid=${line#UID=} ;;
                 esac
             done < "$f"
-            if [ "$cls" = "user" ] || { [ -z "$cls" ] && [ "${uid:-0}" -ge "$MIN_HUMAN_UID" ] 2>/dev/null; }; then
+            if [ "$cls" = user ] || { [ -z "$cls" ] && [ "${uid:-0}" -ge "$MIN_HUMAN_UID" ] 2>/dev/null; }; then
                 sess_n=$((sess_n + 1))
             fi
         done
     done
-    # NOTE: deliberately no `loginctl` fallback. Before elogind has created its
-    # state directory (i.e. early boot) that would be a D-Bus call to a name
-    # nobody owns yet, which makes D-Bus *activate* elogind once a second and
-    # races with the init system's own elogind start.
 
-    # 3. X servers owned by a human uid (startx-style). The DM's root/system
-    #    owned greeter server is ignored.
     if [ -d /tmp/.X11-unix ]; then
         x_n=$(find /tmp/.X11-unix -maxdepth 1 -name 'X*' -type s \
                 -uid +$((MIN_HUMAN_UID - 1)) 2>/dev/null | wc -l)
     fi
 
-    # 4. Wayland sockets belonging to human uids.
-    shopt -s nullglob
     for w in /run/user/[0-9]*/wayland-[0-9]*; do
         [ -S "$w" ] || continue
         uid=${w#/run/user/}
         uid=${uid%%/*}
         [ "$uid" -ge "$MIN_HUMAN_UID" ] && wl_n=$((wl_n + 1))
     done
-    shopt -u nullglob
 
     echo "$who_n $sess_n $x_n $wl_n"
 }
@@ -1051,15 +1029,6 @@ get_logged_in_users() {
     echo "$max"
 }
 
-responsive_sleep() {
-    local remaining="$1"
-    while [ "$remaining" -gt 0 ]; do
-        sleep 1
-        remaining=$((remaining - 1))
-    done
-}
-
-# Number of display-manager greeter sessions logind reports (files only, no D-Bus).
 count_greeter_sessions() {
     local dir f line n=0
     for dir in "${SESSION_DIRS[@]}"; do
@@ -1067,7 +1036,7 @@ count_greeter_sessions() {
         for f in "$dir"/*; do
             [ -f "$f" ] || continue
             while IFS= read -r line; do
-                if [ "$line" = "CLASS=greeter" ]; then
+                if [ "$line" = CLASS=greeter ]; then
                     n=$((n + 1))
                     break
                 fi
@@ -1086,265 +1055,250 @@ have_session_dir() {
 }
 
 wait_for_login() {
-    log "Waiting for user login (or an idle display-manager greeter)..."
     local waited=0 warned=0 greeter_secs=0
+    log "Waiting for user login (or an idle display-manager greeter)..."
     START_TRIGGER=""
-
-    while true; do
-        local users
-        users=$(get_logged_in_users)
-
-        if [ "$users" -gt 0 ]; then
-            log "User login detected ($users user(s); who/sessions/x11/wayland = $(login_signal_counts))"
-            START_TRIGGER="human"
+    while :; do
+        if [ "$(get_logged_in_users)" -gt 0 ]; then
+            log "User login detected (who/sessions/x11/wayland = $(login_signal_counts))"
+            START_TRIGGER=human
             return 0
         fi
-
-        # A greeter that has been showing for a few seconds means the display
-        # manager is up and idle: mount now, before the user starts logging in.
         if [ "$GREETER_SETTLE_SECONDS" -gt 0 ]; then
             if [ "$(count_greeter_sessions)" -gt 0 ]; then
                 greeter_secs=$((greeter_secs + 1))
                 if [ "$greeter_secs" -ge "$GREETER_SETTLE_SECONDS" ]; then
-                    log "Display-manager greeter idle for ~${greeter_secs}s - starting overlay before login"
-                    START_TRIGGER="greeter"
+                    log "Display-manager greeter idle for ${greeter_secs}s - starting overlay before login"
+                    START_TRIGGER=greeter
                     return 0
                 fi
             else
                 greeter_secs=0
             fi
         fi
-
-        responsive_sleep 1
-
+        snooze 1
         waited=$((waited + 1))
         if [ "$warned" -eq 0 ] && [ "$waited" -ge 120 ] && ! have_session_dir; then
             warned=1
-            log "WARNING: no elogind session directory found (tried: ${SESSION_DIRS[*]}); only tty/X11/Wayland logins can be detected. Set SESSION_DIRS if elogind keeps its state elsewhere."
+            log "WARNING: no elogind session directory found (tried: ${SESSION_DIRS[*]}); only tty/X11/Wayland logins can be detected"
         fi
     done
 }
 
-CLEANUP_DONE=0
+session_loop() {
+    local now next_clean next_sync confirm=0 seen_human=0
+    [ "$START_TRIGGER" = human ] && seen_human=1
+    [ "$(get_logged_in_users)" -gt 0 ] && seen_human=1
+    next_clean=$((SECONDS + CLEAN_INTERVAL))
+    next_sync=$((SECONDS + SYNC_INTERVAL))
+    while :; do
+        if [ "$confirm" -gt 0 ]; then
+            snooze "$LOGOUT_CONFIRM_INTERVAL"
+        else
+            snooze "$CLEAN_INTERVAL"
+        fi
+        now=$SECONDS
+        if [ "$now" -ge "$next_clean" ]; then
+            next_clean=$((now + CLEAN_INTERVAL))
+            cleanup_stale_files
+            check_memory_pressure
+            ensure_watchers
+            sync_overlays dirty "${EAGER_SYNC_DIRS[@]}" || log "WARNING: eager sync reported failures"
+        fi
+        if [ "$SYNC_INTERVAL" -gt 0 ] && [ "$now" -ge "$next_sync" ]; then
+            next_sync=$((now + SYNC_INTERVAL))
+            sync_overlays dirty "${OVERLAY_DIRS[@]}" || log "WARNING: periodic sync reported failures"
+        fi
+        if [ "$(get_logged_in_users)" -gt 0 ]; then
+            [ "$seen_human" -eq 1 ] || log "First user login since the overlay started"
+            seen_human=1
+            confirm=0
+            continue
+        fi
+        [ "$seen_human" -eq 1 ] || continue
+        confirm=$((confirm + 1))
+        log "No logged-in users detected (confirmation $confirm/$LOGOUT_CONFIRM_CHECKS)"
+        [ "$confirm" -ge "$LOGOUT_CONFIRM_CHECKS" ] && return 0
+    done
+}
 
 shutdown_cleanup() {
+    trap '' TERM INT HUP
+    trap - EXIT
     [ "$CLEANUP_DONE" -eq 1 ] && exit 0
     CLEANUP_DONE=1
     thaw_supervisors
-
     log "Shutdown/reboot signal received - syncing all changes to disk..."
     stop_overlay
-    rm -f "$DAEMON_PIDFILE"
+    rm -f -- "$DAEMON_PIDFILE"
     log "Shutdown sync complete - exiting"
     exit 0
 }
 
 cli_status() {
-    echo "=== ramoverlay status ==="
-    echo "State file ($STATE_FILE):"
-    if [ -f "$STATE_FILE" ]; then
-        sed 's/^/  /' "$STATE_FILE"
+    local dir state=inactive pid n pending watch
+    [ -s "$STATE_FILE" ] && read -r state < "$STATE_FILE"
+    if [ -s "$DAEMON_PIDFILE" ] && read -r pid < "$DAEMON_PIDFILE" && kill -0 "$pid" 2>/dev/null; then
+        printf '%-10s PASS  running, PID %s, state %s\n' daemon "$pid" "$state"
     else
-        echo "  (missing -- overlay is not active)"
+        printf '%-10s FAIL  not running, state %s\n' daemon "$state"
     fi
-    echo
-    if [ -f "$DAEMON_PIDFILE" ] && kill -0 "$(cat "$DAEMON_PIDFILE")" 2>/dev/null; then
-        echo "Daemon: running (PID $(cat "$DAEMON_PIDFILE"))"
-    else
-        echo "Daemon: NOT running (pidfile: ${DAEMON_PIDFILE})"
-    fi
-    if [ -f "$INOTIFY_PIDFILE" ] && kill -0 "$(cat "$INOTIFY_PIDFILE")" 2>/dev/null; then
-        echo "inotify watcher: running (PID $(cat "$INOTIFY_PIDFILE")) -- syncs will be incremental"
-    else
-        echo "inotify watcher: NOT running -- syncs will fall back to full-tree rsync"
-    fi
-    if [ -f "$EAGER_INOTIFY_PIDFILE" ] && kill -0 "$(cat "$EAGER_INOTIFY_PIDFILE")" 2>/dev/null; then
-        echo "eager watcher: running (PID $(cat "$EAGER_INOTIFY_PIDFILE")) -- ${EAGER_SYNC_DIRS[*]} sync within ${CLEAN_INTERVAL}s of a write"
-    else
-        echo "eager watcher: NOT running -- ${EAGER_SYNC_DIRS[*]} will only sync on the ${SYNC_INTERVAL}s periodic cycle"
-    fi
-    echo
-    echo "Overlay directories:"
-    local dir
     for dir in "${OVERLAY_DIRS[@]}"; do
-        local fstype lower_dir upper_dir
-        fstype=$(findmnt -n -o FSTYPE --target "$dir" 2>/dev/null)
-        lower_dir="$LOWER_ROOT$dir"
-        upper_dir="$OVERLAY_BASE/upper${dir}"
-        echo "  $dir"
-        echo "    live mount:        ${fstype:-NOT a mountpoint (writes are hitting disk directly)}"
-        if mountpoint -q -- "$lower_dir" 2>/dev/null; then
-            echo "    lower bind mount:  OK -> $lower_dir (this is the path sync writes to)"
-        else
-            echo "    lower bind mount:  MISSING ($lower_dir) -- sync has nowhere to write real changes to"
+        if ! is_our_overlay "$dir"; then
+            printf '%-10s FAIL  no RAM overlay, writes go straight to disk\n' "$dir"
+            continue
         fi
-        if [ -d "$upper_dir" ]; then
-            local pending
-            pending=$(find "$upper_dir" -mindepth 1 2>/dev/null | wc -l)
-            echo "    upper (RAM) dir:   $upper_dir ($pending entries currently in RAM)"
+        if ! mountpoint -q -- "$LOWER_ROOT$dir"; then
+            printf '%-10s FAIL  overlay mounted but %s is missing, changes cannot be synced\n' "$dir" "$LOWER_ROOT$dir"
+            continue
         fi
+        n=$("${FIND[@]}" "$OVERLAY_BASE/upper$dir" -mindepth 1 2>/dev/null | wc -l)
+        watch="no watcher, syncs every interval"
+        watcher_pid "$dir" && watch="watcher PID $REPLY"
+        pending=no
+        [ -s "$RUN_DIR/dirty${dir//\//_}" ] && pending=yes
+        printf '%-10s PASS  overlay mounted, %s, unsynced changes: %s, %s entries in RAM\n' "$dir" "$watch" "$pending" "$n"
     done
 }
 
 cli_sync() {
-    check_root
-    if ! is_active; then
-        echo "Overlay is not active on this system right now -- nothing to sync." >&2
+    check_root || exit 1
+    load_active
+    if [ ${#ACTIVE[@]} -eq 0 ]; then
+        echo "FAIL: the RAM overlay is not active"
         exit 1
     fi
     log "Manual sync requested via CLI"
-    if sync_changes 0; then
-        echo "Sync completed with no reported failures. Full detail in $LOG_FILE."
+    if sync_overlays all "${ACTIVE[@]}"; then
+        echo "PASS: all changes written to disk"
         exit 0
-    else
-        echo "Sync reported at least one failure -- see $LOG_FILE for the exact rsync error." >&2
-        exit 1
     fi
+    echo "FAIL: sync reported errors, see $LOG_FILE"
+    exit 1
+}
+
+cli_scrub() {
+    local dir base maj min path line f n=0 x=0 attr=0
+    check_root || exit 1
+    mkdir -p -- "$RUN_DIR" || exit 1
+    command -v getfattr >/dev/null 2>&1 && command -v setfattr >/dev/null 2>&1 && attr=1
+    {
+        flock -w "$SYNC_LOCK_TIMEOUT" 7 || { echo "FAIL: sync lock busy"; exit 1; }
+        for dir in "${OVERLAY_DIRS[@]}"; do
+            base=$dir
+            if is_our_overlay "$dir"; then
+                base=$LOWER_ROOT$dir
+                if ! mountpoint -q -- "$base"; then
+                    echo "FAIL: $dir is overlaid but $base is not mounted"
+                    continue
+                fi
+            fi
+            [ -d "$base" ] || continue
+            while IFS=: read -r maj min path; do
+                [ "$maj:$min" = 0:0 ] || continue
+                if rm -f -- "$path"; then
+                    n=$((n + 1))
+                    echo "REMOVED  $dir${path#"$base"}"
+                fi
+            done < <("${FIND[@]}" "$base" -xdev -type c -exec stat -c '%t:%T:%n' -- {} + 2>/dev/null)
+            [ "$attr" -eq 1 ] || continue
+            while IFS= read -r line; do
+                case $line in
+                    '# file: '*)
+                        f=${line#'# file: '}
+                        f=${f//\\/\\0}
+                        printf -v f '%b' "$f"
+                        ;;
+                    trusted.overlay.*)
+                        if setfattr -h -x "$line" "$f"; then
+                            x=$((x + 1))
+                            echo "CLEARED  $line on $dir${f#"$base"}"
+                        fi
+                        ;;
+                esac
+            done < <(getfattr -R -h -P --absolute-names -m '^trusted\.overlay\.' "$base" 2>/dev/null)
+        done
+    } 7> "$SYNC_LOCK"
+    [ "$attr" -eq 1 ] || echo "NOTE: getfattr/setfattr not installed, overlay xattrs were not checked"
+    echo "PASS: $n whiteout node(s) removed, $x overlay xattr(s) cleared"
+    exit 0
 }
 
 cli_log() {
-    local n="${1:-50}"
+    local n=${1:-50}
+    [[ $n =~ ^[0-9]+$ ]] || n=50
     if [ -f "$LOG_FILE" ]; then
-        tail -n "$n" "$LOG_FILE"
-    else
-        echo "No log file at $LOG_FILE yet." >&2
-        exit 1
+        tail -n "$n" -- "$LOG_FILE"
+        exit 0
     fi
+    echo "No log file at $LOG_FILE yet." >&2
+    exit 1
 }
 
-case "${1:-}" in
-    status)
-        cli_status
+main() {
+    init_paths
+    validate_config
+    case "${1:-}" in
+        status)
+            check_root || exit 1
+            cli_status
+            exit 0
+            ;;
+        sync) cli_sync ;;
+        scrub) cli_scrub ;;
+        log) cli_log "${2:-}" ;;
+        "") ;;
+        *)
+            echo "Usage: $0 [status|sync|scrub|log [N]]" >&2
+            echo "  (no argument)  run the daemon loop" >&2
+            exit 1
+            ;;
+    esac
+
+    check_root || exit 1
+    mkdir -p -- "$RUN_DIR" "${LOG_FILE%/*}" || exit 1
+    chmod 0700 "$RUN_DIR"
+    exec 9> "$DAEMON_LOCK"
+    if ! flock -n 9; then
+        log "Another instance holds $DAEMON_LOCK - exiting"
         exit 0
-        ;;
-    sync)
-        cli_sync
-        exit 0
-        ;;
-    log)
-        cli_log "${2:-}"
-        exit 0
-        ;;
-    "")
-        ;;
-    *)
-        echo "Usage: $0 [status|sync|log [N]]" >&2
-        echo "  (no argument)  run the daemon loop" >&2
-        exit 1
-        ;;
-esac
+    fi
+    printf '%s\n' "$$" > "$DAEMON_PIDFILE"
+    trap '' PIPE
+    trap shutdown_cleanup EXIT TERM INT HUP
 
-check_root
-
-if [ -f "$DAEMON_PIDFILE" ] && kill -0 "$(cat "$DAEMON_PIDFILE")" 2>/dev/null; then
-    log "Already running with PID $(cat "$DAEMON_PIDFILE") - exiting"
-    exit 0
-fi
-
-echo $$ > "$DAEMON_PIDFILE"
-
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE" || true
-
-log "Unified RAM overlay daemon started (PID: $$)"
-log "Overlay directories: ${OVERLAY_DIRS[*]}"
-if ! command -v rsync >/dev/null 2>&1; then
-    log "WARNING: rsync not found in PATH ($PATH) - the overlay cannot pre-populate or sync back to disk. Install rsync."
-fi
-if [ "$USE_LSOF" -eq 1 ]; then
-    log "Using lsof to detect open files (batched once per cleanup pass)"
-elif [ "$USE_FUSER" -eq 1 ]; then
-    log "Using fuser to detect open files (per-file check; install lsof for a faster batched check)"
-else
-    log "Using /proc fallback to detect open files (batched once per cleanup pass)"
-fi
-
-trap shutdown_cleanup EXIT SIGTERM SIGINT SIGHUP
-
-while true; do
-    wait_for_login
-
-    log "Starting RAM overlay system..."
-    if start_overlay; then
-        if is_degraded; then
-            log "WARNING: RAM overlay started in DEGRADED mode — one or more overlays failed to mount"
-            log "Writes to failed directories are going directly to disk"
-        else
-            log "RAM overlay started successfully"
-            log "System is now running with RAM-backed directories"
-            log "Check 'findmnt -t overlay' to see active overlays"
-        fi
+    log "Unified RAM overlay daemon started (PID $$)"
+    log "Overlay directories: ${OVERLAY_DIRS[*]}"
+    [ "$HAVE_RSYNC" -eq 1 ] || log "WARNING: rsync not found in PATH ($PATH); overlays will not be mounted"
+    [ "$HAVE_INOTIFY" -eq 1 ] || log "inotifywait not found: every sync interval does a full sync"
+    if [ "$USE_LSOF" -eq 1 ]; then
+        log "Using lsof to detect open files"
+    elif [ "$USE_FUSER" -eq 1 ]; then
+        log "Using fuser to detect open files (install lsof for a batched check)"
     else
-        log "ERROR: Failed to start RAM overlay - will retry on next login"
-        responsive_sleep 5
-        continue
+        log "Using /proc to detect open files"
+    fi
+    if [ -s "$MOUNTS_FILE" ]; then
+        load_active
+        log "Found mounts from a previous instance, syncing them now"
+        sync_overlays all "${ACTIVE[@]}" || log "WARNING: sync of leftover overlays reported failures"
     fi
 
-    elapsed_since_sync=0
-    logout_confirm_count=0
-    # The overlay may have been started from an idle greeter, before anyone
-    # logged in. "No users" is only a logout once a human has been seen.
-    seen_human=0
-    [ "$START_TRIGGER" = "human" ] && seen_human=1
-    [ "$(get_logged_in_users)" -gt 0 ] && seen_human=1
-    while true; do
-        responsive_sleep "$CLEAN_INTERVAL"
-        cleanup_stale_files
-        check_memory_pressure
-
-        if [ -s "$EAGER_INOTIFY_QUEUE" ]; then
-            log "Pending changes in ${EAGER_SYNC_DIRS[*]}, syncing..."
-            sync_changes 0 "${EAGER_SYNC_DIRS[@]}" || log "WARNING: eager sync reported failures"
-            : > "$EAGER_INOTIFY_QUEUE"
-        fi
-
-        if [ "$SYNC_INTERVAL" -gt 0 ]; then
-            elapsed_since_sync=$((elapsed_since_sync + CLEAN_INTERVAL))
-            if [ "$elapsed_since_sync" -ge "$SYNC_INTERVAL" ]; then
-                elapsed_since_sync=0
-                watcher_alive=0
-                [ -f "$INOTIFY_PIDFILE" ] && kill -0 "$(cat "$INOTIFY_PIDFILE")" 2>/dev/null && watcher_alive=1
-                log "Periodic sync (interval=${SYNC_INTERVAL}s)..."
-                sync_changes "$watcher_alive" || log "WARNING: periodic sync reported failures"
-            fi
-        fi
-
-        if [ "$(get_logged_in_users)" -gt 0 ]; then
-            if [ "$seen_human" -eq 0 ]; then
-                log "First user login since the overlay started"
-            fi
-            seen_human=1
-            logout_confirm_count=0
+    while :; do
+        wait_for_login
+        if ! start_overlay; then
+            snooze 5
             continue
         fi
-
-        # Nobody has logged in yet (overlay is waiting behind an idle greeter).
-        if [ "$seen_human" -eq 0 ]; then
-            continue
-        fi
-
-        logout_confirm_count=$((logout_confirm_count + 1))
-        log "No logged-in users detected (confirmation $logout_confirm_count/$LOGOUT_CONFIRM_CHECKS)..."
-        if [ "$logout_confirm_count" -lt "$LOGOUT_CONFIRM_CHECKS" ]; then
-            responsive_sleep "$LOGOUT_CONFIRM_INTERVAL"
-            continue
-        fi
-
-        break
+        session_loop
+        log "All users logged out - stopping the overlay"
+        snooze 2
+        stop_overlay || log "ERROR: issues while stopping the overlay"
+        log "System ready for next login cycle"
+        snooze 5
     done
+}
 
-    log "All users logged out - initiating shutdown sequence"
-
-    responsive_sleep 2
-
-    log "Stopping and syncing RAM overlay..."
-    if stop_overlay; then
-        log "RAM overlay stopped and synced successfully"
-    else
-        log "ERROR: Issues during RAM overlay shutdown"
-    fi
-
-    log "System ready for next login cycle"
-
-    responsive_sleep 5
-done
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
