@@ -29,7 +29,7 @@ Directories listed in `KEEP_VAR_CACHE_DIRS` (default `lightdm`) are recreated on
 
 Essential caches bind-mounted from `/persist` to survive reboots:
 * System: `/var/cache/pacman` and `/var/cache/xbps`, whichever exist on disk or are already in `/persist`
-* User: `paru`, `nvidia`, `mesa_shader_cache`, `mesa_shader_cache_db`, `TauonMusicBox`
+* User: `paru`, `nvidia`, `mesa_shader_cache`, `mesa_shader_cache_db`
 * Migrated automatically on first run with `mv`. With `/persist` on the same filesystem that's a rename, so even a multi-GB package cache moves instantly
 
 ### Excluded from Overlay (Remain on Disk)
@@ -46,22 +46,23 @@ Within an overlaid directory, `/var/log/journal` is excluded from sync (`EXCLUDE
 
 **runit service directories:** When `runsvdir` is running and `/etc` is overlaid, `/etc/runit`, `/etc/sv` and `/etc/service` (`INIT_PROTECT_DIRS`) stay on disk. They're bound from disk back over the overlay and `runsvdir` is paused while `/etc` is swapped, so it never sees its service directories change underneath it and restart services. It resumes after 3 seconds even if the daemon dies mid-swap. Entries that are symlinks are skipped.
 
-Anything in `EXCLUDED_FROM_OVERLAY` is handled the same way: bound from disk over the overlay, never in RAM and never synced.
+Anything in `EXCLUDED_FROM_OVERLAY` is handled the same way: bound from disk over the overlay, never in RAM and never synced. By default that's `/var/log/dmesg`, so kernel messages are written straight to disk and survive a crash for troubleshooting. Entries can be files or directories; one that doesn't exist when the overlay starts is skipped with a note in the log.
 
 ### Cleanup & Safety
 
-* **Periodic cleanup:** Every 30 seconds, deletes files older than 5 minutes (by modification time) that no process has open. Only TMPFS mounts get cleaned (`/tmp`, `/var/tmp`, `/var/cache`, `~/.cache`), whether the daemon mounted them or fstab did. A `/tmp` left on disk is never touched. Raise `STALE_MINUTES` if you build software in `/tmp`, since object files older than 5 minutes get deleted mid-build
+* **Periodic cleanup:** Every 30 seconds, deletes files older than 5 minutes (by modification time) that no process has open or memory-mapped. Only TMPFS mounts get cleaned (`/tmp`, `/var/tmp`, `/var/cache`, `~/.cache`), whether the daemon mounted them or fstab did. A `/tmp` left on disk is never touched. Raise `STALE_MINUTES` if you build software in `/tmp`, since object files older than 5 minutes get deleted mid-build. Files matching `CLEAN_SKIP_NAMES` are never deleted. By default that's X server lock files (`/tmp/.X0-lock`) and PostgreSQL socket locks, which nothing holds open but which must stay put
+* **Cheap when idle:** The open-file check reads `/proc` directly: one `find` over every process's open descriptors plus their memory maps, filtered to the TMPFS devices and matched by device and inode. That takes tens of milliseconds where a full `lsof` pass took several seconds of CPU. It only runs when there are stale files to judge. When every stale file is one that was already open at the last check (a browser or IDE cache held open all session), it waits `INUSE_RECHECK_SECONDS` (5 minutes) before checking again. That only delays deleting a file that has since been closed, it never deletes more
 * **Periodic sync:** Each overlaid directory has an inotify watcher that marks it dirty on any write, attribute change, create, delete or rename. `/etc` (`EAGER_SYNC_DIRS`) is checked every `CLEAN_INTERVAL` (30 seconds by default) and synced if dirty, everything else every `SYNC_INTERVAL` (5 minutes, `0` to disable). A directory nothing wrote to isn't synced at all. Without `inotifywait`, every check does a sync. A final sync runs at logout and shutdown. This bounds how much a crash or power loss mid-session can cost you
 * **Deletions reach disk:** Files and directories deleted in RAM are removed from disk and a directory that was deleted and recreated doesn't keep its old files
-* **File protection:** Cleanup skips files currently in use, checked via `lsof`, `fuser`, or `/proc`
+* **File protection:** Cleanup skips files currently open or memory-mapped by any process, read from `/proc/PID/fd` and `/proc/PID/maps`. Files are matched by device and inode, not by path, so a file opened through a bind mount or from inside a container or Flatpak sandbox still counts as in use. If `/proc` can't be read, cleanup skips that round instead of deleting anything
 * **Graceful shutdown:** Catches SIGTERM, SIGINT and SIGHUP, plus unexpected exits and syncs before exiting
 * **Single instance:** A lock on `/var/run/ramoverlay/daemon.lock` makes a second copy exit right away
-* **Logging:** All operations are tracked in `/var/log/ramoverlay.log` for the current session. The previous session's log gets archived to `/var/log/ramoverlay.last.log` and the main log is truncated at the end of each session, so only the current and immediately prior session stick around. The log lives inside the `/var/log` overlay, so the line or two written between the final sync of `/var/log` and its unmount are lost with the RAM layer
+* **Logging:** All operations are tracked in `/var/log/ramoverlay.log` for the current session. The previous session's log gets archived to `/var/log/ramoverlay.last.log` and the main log is truncated at the end of each session, so only the current and immediately prior session stick around. The log lives inside the `/var/log` overlay, so the line or two written between the final sync of `/var/log` and its unmount are lost with the RAM layer. The daemon's own log writes don't mark `/var/log` dirty, otherwise each "Synced /var/log" line would trigger the next sync on an otherwise idle system. The log goes to disk whenever anything else in `/var/log` changes and at logout
 * **Memory-pressure warning:** Logs a warning once when available RAM drops below 10% (`MEM_WARN_PERCENT`) and another line when it recovers. Sustained pressure risks the OOM killer targeting Xorg or the compositor
 
 ### Mimalloc Integration
 
-Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync`, `find` and `inotifywait` when available, cutting down on memory fragmentation during sync operations and long-lived event watching.
+Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync`, `find` and `inotifywait` when available, cutting down on memory fragmentation during sync operations and long-lived event watching. The library is looked up in `/usr/lib`, `/usr/lib64`, `/usr/lib/<arch>-linux-gnu` and `/usr/local/lib`, so Debian/Ubuntu multiarch installs are picked up too. The log says at startup which one is in use.
 
 ## Requirements
 
@@ -69,7 +70,6 @@ Preloads [mimalloc](https://github.com/microsoft/mimalloc) for `rsync`, `find` a
 * **RAM:** 16GB+ recommended
 * **Filesystem:** Supports OverlayFS (ext4, btrfs, xfs, f2fs)
 * **Optional:** `inotifywait` (inotify-tools) for dirty tracking. Without it, every sync interval does a full sync
-* **Optional:** `lsof` or `fuser`. Falls back to `/proc` scanning if neither is present
 * **Optional:** `getfattr`/`setfattr` (`attr`, `attr-progs` on Void), only used by `scrub` to clear leftover overlay attributes
 * **Optional:** `libmimalloc.so` for faster syncs
 * **Optional:** Kernel 6.4+ for the TMPFS `noswap` mount option. Tried first, falls back cleanly on older kernels, so it's not required
@@ -154,7 +154,9 @@ EXCLUDED_FROM_SYNC=(              # Overlaid, but changes are never written back
     "/var/lib/systemd"
     "/var/log/journal"
 )
-EXCLUDED_FROM_OVERLAY=()          # Bound from disk over the overlay, never in RAM
+EXCLUDED_FROM_OVERLAY=(           # Bound from disk over the overlay, never in RAM
+    "/var/log/dmesg"
+)
 ```
 
 **Persistent system caches:**
@@ -180,6 +182,8 @@ USER_CACHE_SIZE="2G"
 ```bash
 CLEAN_INTERVAL=30          # Cleanup and /etc sync check, in seconds
 STALE_MINUTES=5            # Delete unopened TMPFS files older than this
+INUSE_RECHECK_SECONDS=300  # Recheck an unchanged set of open stale files this often
+CLEAN_SKIP_NAMES=(".X*-lock" ".s.PGSQL.*.lock")  # File-name globs cleanup never deletes
 SYNC_INTERVAL=300          # Sync the other dirs every 5 min if dirty; 0 to disable
 GREETER_SETTLE_SECONDS=5   # Start behind an idle greeter after this long; 0 waits for a real login
 LOGOUT_CONFIRM_CHECKS=3    # Consecutive "no users" checks before teardown
@@ -231,7 +235,7 @@ tail -f /var/log/ramoverlay.log
 1. **Wait:** Daemon waits for a login (tty, elogind session, or an X or Wayland socket owned by a regular user) or an idle greeter
 2. **Activate:** Creates the TMPFS mounts, then the RAM overlays. Every mount is recorded so teardown only touches what the daemon created
 3. **Operate:** All writes to overlaid directories go to RAM (9.3x faster). Untouched files are still read from disk
-4. **Cleanup:** Daemon removes stale temp files every 30 seconds
+4. **Cleanup:** Daemon removes stale temp files nothing has open, checked every 30 seconds
 5. **Sync:** Writes dirty directories back to disk, `/etc` within about 30 seconds of a change and the rest every 5 minutes, then a final sync on logout
 6. **Sleep:** Once no users are seen at a 30-second check and at two more checks 10 seconds apart, syncs, unmounts everything it mounted, frees RAM and waits for the next login
 
@@ -254,7 +258,6 @@ tail -f /var/log/ramoverlay.log
 * **Sync lock:** The daemon's syncs, `sync` and `scrub` share `/var/run/ramoverlay/sync.lock`, so two rsyncs never write the same disk tree at once
 * **Mount tracking:** Every mount the daemon creates is recorded in `/var/run/ramoverlay/mounts` and torn down in reverse order. Mounts it didn't create are never unmounted. An overlay that's still busy at teardown is detached lazily and synced once more from RAM before its RAM is released. A restarted daemon takes over an overlay that's still mounted and syncs it right away instead of starting fresh
 * **Protected directories:** `/home` is never overlaid by default. It's just not in `OVERLAY_DIRS`. There's no code-level check blocking it either, so treat this as a strong default, not a hard guarantee. Don't add `/home` to `OVERLAY_DIRS` yourself
-* **Fallback mechanisms:** Multiple methods for file-in-use detection
 
 **Deletion handling:** OverlayFS records a deleted file as a `0,0` character device (a whiteout) in the RAM layer and a replaced directory as an extended attribute. Copying those to disk turns deleted files into device nodes. Instead, for every directory that exists in RAM, the sync compares the disk copy with the live overlay view and removes whatever the live view no longer shows. Then it copies the RAM layer over, skipping device nodes and `trusted.overlay.*` attributes. Comparing against the live view also covers what whiteouts miss: a file deleted inside a directory that was created this session and already synced leaves no whiteout at all.
 

@@ -3,8 +3,17 @@
 set -o pipefail
 shopt -s nullglob
 
+MIMALLOC_LIB=""
+for _lib in /usr/lib/libmimalloc.so /usr/lib64/libmimalloc.so /usr/lib/*-linux-gnu/libmimalloc.so \
+    /usr/local/lib/libmimalloc.so /usr/lib/libmimalloc.so.[0-9]*; do
+    if [ -r "$_lib" ]; then
+        MIMALLOC_LIB=$_lib
+        break
+    fi
+done
+unset _lib
 PRELOAD=()
-[ -r /usr/lib/libmimalloc.so ] && PRELOAD=(env LD_PRELOAD=/usr/lib/libmimalloc.so)
+[ -n "$MIMALLOC_LIB" ] && PRELOAD=(env "LD_PRELOAD=$MIMALLOC_LIB")
 RSYNC=("${PRELOAD[@]}" rsync)
 FIND=("${PRELOAD[@]}" find)
 INOTIFYWAIT=("${PRELOAD[@]}" inotifywait)
@@ -26,7 +35,10 @@ OVERLAY_BASE_SIZE="50%"
 
 CLEAN_INTERVAL=30
 STALE_MINUTES=5
+INUSE_RECHECK_SECONDS=300
 MEM_WARN_PERCENT=10
+
+CLEAN_SKIP_NAMES=(".X*-lock" ".s.PGSQL.*.lock")
 
 LOGOUT_CONFIRM_CHECKS=3
 LOGOUT_CONFIRM_INTERVAL=10
@@ -66,6 +78,8 @@ EXCLUDED_FROM_SYNC=(
 )
 
 EXCLUDED_FROM_OVERLAY=(
+    "/var/log/dmesg"
+    "/var/log/dmesg.log"
 )
 
 OVERLAY_MOUNT_OPTS=(
@@ -78,13 +92,6 @@ HAVE_RSYNC=0
 command -v rsync >/dev/null 2>&1 && HAVE_RSYNC=1
 HAVE_INOTIFY=0
 command -v inotifywait >/dev/null 2>&1 && HAVE_INOTIFY=1
-USE_LSOF=0
-USE_FUSER=0
-if command -v lsof >/dev/null 2>&1; then
-    USE_LSOF=1
-elif command -v fuser >/dev/null 2>&1; then
-    USE_FUSER=1
-fi
 
 MOUNTS_FILE=""
 SYNC_LOCK=""
@@ -99,6 +106,9 @@ MEM_LOW=0
 CLEANUP_DONE=0
 PRUNED=0
 CACHE_OWNER=""
+KEPT_SIG=""
+KEPT_AT=0
+INUSE_WARNED=0
 ACTIVE=()
 SKIPS=()
 WHITEOUTS=()
@@ -107,6 +117,7 @@ HOME_USERS=()
 HOME_DIRS=()
 declare -A SKIP_SET=()
 declare -A MT_FSTYPE=()
+declare -A MT_DEV=()
 declare -A INUSE_SET=()
 
 init_paths() {
@@ -179,15 +190,25 @@ rsync_literal() {
     esac
 }
 
+ere_literal() {
+    local c
+    REPLY=${1//\\/\\\\}
+    for c in . '[' ']' '(' ')' '*' + '?' '{' '}' '|' '^' '$'; do
+        REPLY=${REPLY//"$c"/"\\$c"}
+    done
+}
+
 load_mount_table() {
-    local _id _pid _dev _root mp _opts rest
+    local _id _pid dev _root mp _opts rest
     MT_FSTYPE=()
-    while read -r _id _pid _dev _root mp _opts rest; do
+    MT_DEV=()
+    while read -r _id _pid dev _root mp _opts rest; do
         mp=${mp//\\/\\0}
         printf -v mp '%b' "$mp"
         rest=" $rest"
         rest=${rest#* - }
         MT_FSTYPE[$mp]=${rest%% *}
+        MT_DEV[$mp]=$dev
     done < /proc/self/mountinfo
 }
 
@@ -415,57 +436,110 @@ start_tmpfs_mounts() {
     fi
 }
 
+# Collects "st_dev:inode" of every regular file that some process has open
+# (/proc/PID/fd) or memory-mapped (/proc/PID/maps), limited to the devices
+# passed in. $1: st_dev numbers (decimal, as find's %D prints them),
+# $2: "maj:min=st_dev" pairs with maj:min in hex the way /proc/PID/maps
+# prints them. Keyed by device and inode, so a file opened through another
+# path (a bind mount, a container's mount namespace) still counts. Returns 1
+# if /proc showed no open files at all, which only happens when reading it
+# failed, so the caller doesn't treat everything as unused.
 build_inuse_index() {
-    local line target
-    local -a fds
+    local key seen=0
+    local -a fd_dirs=(/proc/[0-9]*/fd) maps=(/proc/[0-9]*/maps)
     INUSE_SET=()
-    if [ "$USE_LSOF" -eq 1 ]; then
-        while IFS= read -r line; do
-            [ "${line:0:1}" = n ] && INUSE_SET["${line:1}"]=1
-        done < <(lsof -Fn 2>/dev/null)
-        return 0
-    fi
-    [ "$USE_FUSER" -eq 1 ] && return 0
-    fds=(/proc/[0-9]*/fd/*)
-    [ ${#fds[@]} -gt 0 ] || return 0
-    while IFS= read -r target; do
-        [ -n "$target" ] && INUSE_SET["$target"]=1
-    done < <(readlink -f -- "${fds[@]}" 2>/dev/null)
+    [ ${#fd_dirs[@]} -gt 0 ] && [ ${#maps[@]} -gt 0 ] || return 1
+    while IFS= read -r key; do
+        case $key in
+            seen\ *) seen=${key#seen } ;;
+            *) INUSE_SET[$key]=1 ;;
+        esac
+    done < <(
+        {
+            "${FIND[@]}" -L "${fd_dirs[@]}" -mindepth 1 -maxdepth 1 -type f -printf 'f %D %i\n' 2>/dev/null
+            cat -- "${maps[@]}" 2>/dev/null
+        } | awk -v dec="$1" -v hex="$2" '
+            BEGIN {
+                n = split(dec, a, " ")
+                for (i = 1; i <= n; i++) want[a[i]] = 1
+                n = split(hex, a, " ")
+                for (i = 1; i <= n; i++) { split(a[i], kv, "="); map[kv[1]] = kv[2] }
+            }
+            $1 == "f" { fds++; if (!($2 in want)) next; k = $2 ":" $3 }
+            $1 != "f" { if ($5 == 0 || !($4 in map)) next; k = map[$4] ":" $5 }
+            !dup[k]++ { print k }
+            END { print "seen " fds + 0 }'
+    )
+    [ "$seen" -gt 0 ]
 }
 
-is_file_in_use() {
-    local real
-    [ -e "$1" ] || return 1
-    if [ "$USE_FUSER" -eq 1 ] && [ "$USE_LSOF" -ne 1 ]; then
-        fuser -s -- "$1" >/dev/null 2>&1
-        return
-    fi
-    real=$(readlink -f -- "$1" 2>/dev/null) || real=$1
-    [ -n "${INUSE_SET[$real]+x}" ]
+# glibc's makedev(): "maj:min" from mountinfo -> st_dev as find's %D prints it
+st_dev_of() {
+    local maj=${1%%:*} min=${1#*:}
+    REPLY=$(( ((maj & 0xfff) << 8) | ((maj & 0xfffff000) << 32) | (min & 0xff) | ((min & 0xffffff00) << 12) ))
 }
 
 cleanup_stale_files() {
-    local -a roots=() candidates=() doomed=()
-    local d f
+    local -a roots=() skip=() keys=() paths=() doomed=()
+    local -A devs=()
+    local d mp rec key sig="" kept="" decs="" hexes="" hex i
     load_mount_table
     for d in /tmp /var/tmp /var/cache; do
         [ "${MT_FSTYPE[$d]:-}" = tmpfs ] && roots+=("$d")
     done
-    load_human_homes
-    for d in "${HOME_DIRS[@]}"; do
-        [ "${MT_FSTYPE[$d/.cache]:-}" = tmpfs ] && roots+=("$d/.cache")
+    for mp in "${!MT_FSTYPE[@]}"; do
+        [[ $mp == /home/*/.cache ]] && [ "${MT_FSTYPE[$mp]}" = tmpfs ] && roots+=("$mp")
     done
     [ ${#roots[@]} -gt 0 ] || return 0
-
-    while IFS= read -r -d '' f; do
-        candidates+=("$f")
-    done < <("${FIND[@]}" "${roots[@]}" -xdev -mindepth 1 -type f -mmin +"$STALE_MINUTES" -print0 2>/dev/null)
-    [ ${#candidates[@]} -gt 0 ] || return 0
-
-    build_inuse_index
-    for f in "${candidates[@]}"; do
-        is_file_in_use "$f" || doomed+=("$f")
+    for d in "${CLEAN_SKIP_NAMES[@]}"; do
+        skip+=(! -name "$d")
     done
+
+    while IFS= read -r -d '' rec; do
+        key=${rec%% *}
+        keys+=("$key")
+        paths+=("${rec#* }")
+        devs[${key%%:*}]=1
+        sig+=" $key"
+    done < <("${FIND[@]}" "${roots[@]}" -xdev -mindepth 1 -type f -mmin +"$STALE_MINUTES" "${skip[@]}" \
+        -printf '%D:%i %p\0' 2>/dev/null)
+    if [ ${#keys[@]} -eq 0 ]; then
+        KEPT_SIG=""
+        return 0
+    fi
+
+    # Every stale file is one that was still open at the last scan: nothing
+    # new to delete, so don't rescan /proc until INUSE_RECHECK_SECONDS pass.
+    # This is the common case on an idle desktop (browser and IDE caches held
+    # open all session) and only ever delays a deletion, never adds one.
+    if [ "$sig" = "$KEPT_SIG" ] && [ $((SECONDS - KEPT_AT)) -lt "$INUSE_RECHECK_SECONDS" ]; then
+        return 0
+    fi
+
+    decs=" ${!devs[*]}"
+    for d in "${roots[@]}"; do
+        mp=${MT_DEV[$d]:-}
+        [[ $mp =~ ^[0-9]+:[0-9]+$ ]] || continue
+        printf -v hex '%02x:%02x' "${mp%%:*}" "${mp#*:}"
+        st_dev_of "$mp"
+        hexes+=" $hex=$REPLY"
+    done
+
+    if ! build_inuse_index "$decs" "$hexes"; then
+        [ "$INUSE_WARNED" -eq 1 ] || log "WARNING: could not list open files from /proc, skipping tmpfs cleanup"
+        INUSE_WARNED=1
+        return 0
+    fi
+    INUSE_WARNED=0
+    for i in "${!keys[@]}"; do
+        if [ -n "${INUSE_SET[${keys[i]}]+x}" ]; then
+            kept+=" ${keys[i]}"
+        else
+            doomed+=("${paths[i]}")
+        fi
+    done
+    KEPT_SIG=$kept
+    KEPT_AT=$SECONDS
     [ ${#doomed[@]} -gt 0 ] || return 0
     printf '%s\0' "${doomed[@]}" | xargs -0 -r rm -f --
     log "Deleted ${#doomed[@]} unopened file(s) older than ${STALE_MINUTES}m from tmpfs"
@@ -492,9 +566,17 @@ check_memory_pressure() {
 
 start_watcher() {
     local id=${1//\//_}
+    local -a excl=()
     printf 'x\n' >> "$RUN_DIR/dirty$id"
     [ "$HAVE_INOTIFY" -eq 1 ] || return 0
-    "${INOTIFYWAIT[@]}" -m -r -q -e modify,attrib,create,delete,move --format x \
+    # The daemon's own log lines must not mark their directory dirty, or
+    # every "Synced /var/log" line would trigger the next sync, forever. The
+    # log file still goes to disk with any other change and at logout.
+    if [[ $LOG_FILE == "$1"/* ]]; then
+        ere_literal "$OVERLAY_BASE/upper$LOG_FILE"
+        excl=(--exclude "^$REPLY\$")
+    fi
+    "${INOTIFYWAIT[@]}" -m -r -q -e modify,attrib,create,delete,move "${excl[@]}" --format x \
         "$OVERLAY_BASE/upper$1" >> "$RUN_DIR/dirty$id" 2>/dev/null 9>&- &
     printf '%s\n' "$!" > "$RUN_DIR/watch$id.pid"
 }
@@ -945,6 +1027,7 @@ start_overlay() {
         return 0
     fi
     log "Starting unified RAM overlay system..."
+    KEPT_SIG=""
     protect_init_dirs
     : > "$MOUNTS_FILE"
     start_tmpfs_mounts
@@ -978,15 +1061,20 @@ start_overlay() {
     return 0
 }
 
-login_signal_counts() {
-    local who_n=0 sess_n=0 x_n=0 wl_n=0
-    local dir f w line cls uid
+# The login checks run every second while waiting and on every session-loop
+# pass, so each one sets REPLY instead of printing into a $(...) subshell, and
+# users_present tries the checks that need no extra process first.
 
-    who_n=$(who 2>/dev/null | awk -v min="$MIN_HUMAN_UID" '
+count_who_users() {
+    REPLY=$(who 2>/dev/null | awk -v min="$MIN_HUMAN_UID" '
         BEGIN { while ((getline l < "/etc/passwd") > 0) { split(l, f, ":"); id[f[1]] = f[3] } }
         ($1 in id) && (id[$1] == 0 || id[$1] >= min) && !seen[$1]++ { n++ }
         END { print n + 0 }')
+    [[ $REPLY =~ ^[0-9]+$ ]] || REPLY=0
+}
 
+count_session_users() {
+    local dir f line cls uid n=0
     for dir in "${SESSION_DIRS[@]}"; do
         [ -d "$dir" ] || continue
         for f in "$dir"/*; do
@@ -1000,50 +1088,68 @@ login_signal_counts() {
                 esac
             done < "$f"
             if [ "$cls" = user ] || { [ -z "$cls" ] && [ "${uid:-0}" -ge "$MIN_HUMAN_UID" ] 2>/dev/null; }; then
-                sess_n=$((sess_n + 1))
+                n=$((n + 1))
             fi
         done
     done
+    REPLY=$n
+}
 
-    if [ -d /tmp/.X11-unix ]; then
-        x_n=$(find /tmp/.X11-unix -maxdepth 1 -name 'X*' -type s \
-                -uid +$((MIN_HUMAN_UID - 1)) 2>/dev/null | wc -l)
+count_x11_users() {
+    local -a socks=()
+    local s uid n=0
+    for s in /tmp/.X11-unix/X*; do
+        [ -S "$s" ] && socks+=("$s")
+    done
+    if [ ${#socks[@]} -gt 0 ]; then
+        while read -r uid; do
+            [ "$uid" -ge "$MIN_HUMAN_UID" ] 2>/dev/null && n=$((n + 1))
+        done < <(stat -c '%u' -- "${socks[@]}" 2>/dev/null)
     fi
+    REPLY=$n
+}
 
+count_wayland_users() {
+    local w uid n=0
     for w in /run/user/[0-9]*/wayland-[0-9]*; do
         [ -S "$w" ] || continue
         uid=${w#/run/user/}
         uid=${uid%%/*}
-        [ "$uid" -ge "$MIN_HUMAN_UID" ] && wl_n=$((wl_n + 1))
+        [ "$uid" -ge "$MIN_HUMAN_UID" ] && n=$((n + 1))
     done
-
-    echo "$who_n $sess_n $x_n $wl_n"
+    REPLY=$n
 }
 
-get_logged_in_users() {
-    local a b c d n max=0
-    read -r a b c d <<< "$(login_signal_counts)"
-    for n in "${a:-0}" "${b:-0}" "${c:-0}" "${d:-0}"; do
-        [ "$n" -gt "$max" ] && max=$n
+users_present() {
+    local f
+    for f in count_session_users count_wayland_users count_x11_users count_who_users; do
+        "$f"
+        [ "$REPLY" -gt 0 ] && return 0
     done
-    echo "$max"
+    return 1
 }
 
-count_greeter_sessions() {
-    local dir f line n=0
+login_signal_counts() {
+    local w s x
+    count_who_users; w=$REPLY
+    count_session_users; s=$REPLY
+    count_x11_users; x=$REPLY
+    count_wayland_users
+    REPLY="$w $s $x $REPLY"
+}
+
+greeter_present() {
+    local dir f line
     for dir in "${SESSION_DIRS[@]}"; do
         [ -d "$dir" ] || continue
         for f in "$dir"/*; do
             [ -f "$f" ] || continue
             while IFS= read -r line; do
-                if [ "$line" = CLASS=greeter ]; then
-                    n=$((n + 1))
-                    break
-                fi
+                [ "$line" = CLASS=greeter ] && return 0
             done < "$f"
         done
     done
-    echo "$n"
+    return 1
 }
 
 have_session_dir() {
@@ -1059,13 +1165,14 @@ wait_for_login() {
     log "Waiting for user login (or an idle display-manager greeter)..."
     START_TRIGGER=""
     while :; do
-        if [ "$(get_logged_in_users)" -gt 0 ]; then
-            log "User login detected (who/sessions/x11/wayland = $(login_signal_counts))"
+        if users_present; then
+            login_signal_counts
+            log "User login detected (who/sessions/x11/wayland = $REPLY)"
             START_TRIGGER=human
             return 0
         fi
         if [ "$GREETER_SETTLE_SECONDS" -gt 0 ]; then
-            if [ "$(count_greeter_sessions)" -gt 0 ]; then
+            if greeter_present; then
                 greeter_secs=$((greeter_secs + 1))
                 if [ "$greeter_secs" -ge "$GREETER_SETTLE_SECONDS" ]; then
                     log "Display-manager greeter idle for ${greeter_secs}s - starting overlay before login"
@@ -1088,7 +1195,7 @@ wait_for_login() {
 session_loop() {
     local now next_clean next_sync confirm=0 seen_human=0
     [ "$START_TRIGGER" = human ] && seen_human=1
-    [ "$(get_logged_in_users)" -gt 0 ] && seen_human=1
+    users_present && seen_human=1
     next_clean=$((SECONDS + CLEAN_INTERVAL))
     next_sync=$((SECONDS + SYNC_INTERVAL))
     while :; do
@@ -1109,7 +1216,7 @@ session_loop() {
             next_sync=$((now + SYNC_INTERVAL))
             sync_overlays dirty "${OVERLAY_DIRS[@]}" || log "WARNING: periodic sync reported failures"
         fi
-        if [ "$(get_logged_in_users)" -gt 0 ]; then
+        if users_present; then
             [ "$seen_human" -eq 1 ] || log "First user login since the overlay started"
             seen_human=1
             confirm=0
@@ -1271,12 +1378,10 @@ main() {
     log "Overlay directories: ${OVERLAY_DIRS[*]}"
     [ "$HAVE_RSYNC" -eq 1 ] || log "WARNING: rsync not found in PATH ($PATH); overlays will not be mounted"
     [ "$HAVE_INOTIFY" -eq 1 ] || log "inotifywait not found: every sync interval does a full sync"
-    if [ "$USE_LSOF" -eq 1 ]; then
-        log "Using lsof to detect open files"
-    elif [ "$USE_FUSER" -eq 1 ]; then
-        log "Using fuser to detect open files (install lsof for a batched check)"
+    if [ -n "$MIMALLOC_LIB" ]; then
+        log "rsync, find and inotifywait run with mimalloc ($MIMALLOC_LIB)"
     else
-        log "Using /proc to detect open files"
+        log "libmimalloc.so not found: rsync, find and inotifywait use the default allocator"
     fi
     if [ -s "$MOUNTS_FILE" ]; then
         load_active
