@@ -384,6 +384,23 @@ x_server_running() {
     return 1
 }
 
+# A live process listening on a socket under /tmp (SDDM's greeter and auth
+# sockets, a Wayland greeter's Xwayland, ICE, tmux...) would lose it under a
+# fresh tmpfs: anything that connects later finds nothing. /proc/net/unix only
+# lists sockets that are bound right now, so stale socket files left on disk
+# from an earlier boot don't count. Sets REPLY to the first one found.
+tmp_socket_in_use() {
+    local _num _ref _proto _flags _type _st _ino path
+    REPLY=""
+    while read -r _num _ref _proto _flags _type _st _ino path; do
+        if [[ $path == /tmp/* ]]; then
+            REPLY=$path
+            return 0
+        fi
+    done < /proc/net/unix
+    return 1
+}
+
 start_tmpfs_mounts() {
     local skip_live=0 skip_tmp=0 d kd
     local -a vc_dirs=()
@@ -397,6 +414,9 @@ start_tmpfs_mounts() {
     elif [ "$SKIP_TMP_WITH_LIVE_X" -eq 1 ] && x_server_running; then
         skip_tmp=1
         log "An X server has its socket and lock file in /tmp: leaving /tmp on disk (mount /tmp from fstab to have it in RAM from boot)"
+    elif [ "$SKIP_TMP_WITH_LIVE_X" -eq 1 ] && tmp_socket_in_use; then
+        skip_tmp=1
+        log "A running process listens on $REPLY: leaving /tmp on disk so it stays reachable (mount /tmp from fstab to have it in RAM from boot)"
     fi
 
     if [ "$skip_tmp" -eq 0 ]; then

@@ -21,6 +21,7 @@ RAM storage for temporary files, discarded when the session ends:
 
 A directory that's already a mountpoint, like `/tmp` from fstab, is left alone and never unmounted by the daemon. Two cases keep `/tmp` on disk for the current session:
 * **An X server is already running** when the overlay starts (`SKIP_TMP_WITH_LIVE_X`). That's always the case when it starts behind a greeter. A fresh TMPFS over `/tmp` would hide the server's socket and lock file, which breaks clients that need the socket file (Flatpak's X11 passthrough) and lets a later X server pick a display number that's already taken. To keep `/tmp` in RAM from boot, mount it from fstab instead: `tmpfs /tmp tmpfs defaults,nosuid,nodev,size=5G,mode=1777 0 0`
+* **Any running process is listening on a socket under `/tmp`** (same `SKIP_TMP_WITH_LIVE_X` switch). This catches display managers that keep their sockets in `/tmp` without a running X server, such as SDDM with a Wayland greeter. Its greeter and login sockets live there, and hiding them under a fresh TMPFS makes the login button do nothing. Only sockets that are bound right now count (from `/proc/net/unix`), so stale socket files from an earlier boot don't keep `/tmp` on disk
 * **A user session is already running** when the daemon starts (`LATE_START_SKIP_TMPFS`). `~/.cache` stays on disk then too, its persistent subdirectories are still bind-mounted
 
 Directories listed in `KEEP_VAR_CACHE_DIRS` (default `lightdm`) are recreated on the `/var/cache` TMPFS with their original owner and mode.
